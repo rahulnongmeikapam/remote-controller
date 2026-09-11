@@ -1,0 +1,7 @@
+Remote Controller is provided for educational and authorized remote-administration use.
+
+You may use, modify, and adapt this project for computers and systems you own or are explicitly authorized to administer. Preserve the original project attribution and permission notice when redistributing the project.
+
+The project includes third-party dependencies. Review and preserve their respective licenses when redistributing them, including the licenses for the stb image libraries and OpenSSL.
+
+THE SOFTWARE IS PROVIDED WITHOUT WARRANTY. THE AUTHORS ARE NOT RESPONSIBLE FOR UNAUTHORIZED ACCESS, DAMAGE, DATA LOSS, OR MISUSE.

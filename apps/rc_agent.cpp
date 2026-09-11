@@ -361,18 +361,22 @@ private:
         std::string filePath;
         uint64_t expectedSize = 0;
         uint64_t receivedSize = 0;
+        uint32_t expectedChunkIndex = 0;
+        uint32_t chunkSize = 0;
+        uint8_t expectedSHA256[32] = {};
         std::ofstream stream;
     };
 
     SOCKET listenSocket = INVALID_SOCKET;
     SOCKET clientSocket = INVALID_SOCKET;
-    SecureChannel crypto;
+    SecureChannel crypto{false};
     ScreenCapture capture;
     InputSimulator input;
-    bool running = false;
-    bool connected = false;
+    std::atomic<bool> running{false};
+    std::atomic<bool> connected{false};
     uint32_t frameId = 0;
-    uint32_t sequence = 0;
+    std::atomic<uint32_t> sequence{0};
+    uint32_t receiveSequence = 0;
     HANDLE captureThread = nullptr;
     HANDLE controlThread = nullptr;
     CRITICAL_SECTION cs;
@@ -383,6 +387,37 @@ private:
     std::string GetReceiveFolder() {
         CreateDirectoryA("received_files", nullptr);
         return "received_files";
+    }
+
+    std::string GetRemoteRoot() {
+        const std::string root = "C:\\RemoteControllerShare";
+        CreateDirectoryA(root.c_str(), nullptr);
+        return root;
+    }
+
+    bool ResolveRemotePath(const char* requested, std::string& resolved) {
+        if (!requested || !*requested) return false;
+
+        char rootBuffer[MAX_PATH] = {};
+        char pathBuffer[MAX_PATH] = {};
+        std::string root = GetRemoteRoot();
+        if (!GetFullPathNameA(root.c_str(), MAX_PATH, rootBuffer, nullptr) ||
+            !GetFullPathNameA(requested, MAX_PATH, pathBuffer, nullptr)) {
+            return false;
+        }
+
+        std::string canonicalRoot = rootBuffer;
+        std::string canonicalPath = pathBuffer;
+        while (canonicalRoot.size() > 3 && canonicalRoot.back() == '\\') canonicalRoot.pop_back();
+        if (canonicalPath.size() < canonicalRoot.size()) return false;
+        for (size_t i = 0; i < canonicalRoot.size(); ++i) {
+            if (std::tolower((unsigned char)canonicalPath[i]) !=
+                std::tolower((unsigned char)canonicalRoot[i])) return false;
+        }
+        if (canonicalPath.size() > canonicalRoot.size() && canonicalPath[canonicalRoot.size()] != '\\') return false;
+
+        resolved = canonicalPath;
+        return true;
     }
 
     std::string BuildUniqueFilePath(const std::string& baseName, uint32_t transferId) {
@@ -410,6 +445,12 @@ private:
     }
 
     bool HandleFileTransferBegin(const FileTransferBegin& begin) {
+        if (begin.transferId == 0 || begin.fileSize > RC_MAX_PACKET_SIZE * 1024ULL ||
+            begin.chunkSize == 0 || begin.chunkSize > RC_MAX_FILE_CHUNK_SIZE ||
+            memchr(begin.fileName, '\0', sizeof(begin.fileName)) == nullptr) {
+            return false;
+        }
+
         ActiveFileTransfer& transfer = fileTransfers[begin.transferId];
 
         if (transfer.stream.is_open()) {
@@ -419,6 +460,9 @@ private:
         transfer.fileName = begin.fileName;
         transfer.expectedSize = begin.fileSize;
         transfer.receivedSize = 0;
+        transfer.expectedChunkIndex = 0;
+        transfer.chunkSize = begin.chunkSize;
+        memcpy(transfer.expectedSHA256, begin.sha256, sizeof(transfer.expectedSHA256));
         transfer.filePath = BuildUniqueFilePath(transfer.fileName, begin.transferId);
         transfer.stream.open(transfer.filePath.c_str(), std::ios::binary | std::ios::out);
 
@@ -443,6 +487,13 @@ private:
             return false;
         }
 
+        if (!chunkData || chunkSize == 0 || chunkSize > transfer.chunkSize ||
+            chunkSize > RC_MAX_FILE_CHUNK_SIZE ||
+            chunkHeader.chunkIndex != transfer.expectedChunkIndex ||
+            chunkSize > transfer.expectedSize - std::min(transfer.receivedSize, transfer.expectedSize)) {
+            return false;
+        }
+
         transfer.stream.write((const char*)chunkData, (std::streamsize)chunkSize);
         if (!transfer.stream.good()) {
             Console::PrintError("Failed while writing file chunk: " + transfer.fileName);
@@ -452,6 +503,7 @@ private:
         }
 
         transfer.receivedSize += (uint64_t)chunkSize;
+        transfer.expectedChunkIndex++;
         return true;
     }
 
@@ -464,6 +516,16 @@ private:
         ActiveFileTransfer& transfer = it->second;
         if (transfer.stream.is_open()) {
             transfer.stream.close();
+        }
+
+        uint8_t actualSHA256[32] = {};
+        bool digestMatches = ComputeFileSHA256(transfer.filePath, actualSHA256) &&
+            memcmp(actualSHA256, transfer.expectedSHA256, sizeof(actualSHA256)) == 0;
+        if (end.status != 0 || transfer.receivedSize != transfer.expectedSize || !digestMatches) {
+            DeleteFileA(transfer.filePath.c_str());
+            Console::PrintError("File transfer rejected: incomplete or invalid file");
+            fileTransfers.erase(it);
+            return;
         }
 
         Console::PrintSuccess("File received: " + transfer.filePath +
@@ -525,6 +587,7 @@ public:
         input.Initialize(config.captureScale);
 
         running = true;
+        sequence.store(0);
 
         Console::PrintSuccess("Agent server started on port " + std::to_string(config.port));
         Console::PrintInfo("Device ID: " + config.deviceId);
@@ -538,14 +601,21 @@ public:
         running = false;
         connected = false;
 
+        if (clientSocket != INVALID_SOCKET) {
+            shutdown(clientSocket, SD_BOTH);
+        }
+        if (listenSocket != INVALID_SOCKET) {
+            shutdown(listenSocket, SD_BOTH);
+        }
+
         if (captureThread) {
-            WaitForSingleObject(captureThread, 2000);
+            WaitForSingleObject(captureThread, INFINITE);
             CloseHandle(captureThread);
             captureThread = nullptr;
         }
 
         if (controlThread) {
-            WaitForSingleObject(controlThread, 2000);
+            WaitForSingleObject(controlThread, INFINITE);
             CloseHandle(controlThread);
             controlThread = nullptr;
         }
@@ -571,6 +641,7 @@ public:
     void DisconnectClient() {
         connected = false;
         if (clientSocket != INVALID_SOCKET) {
+            shutdown(clientSocket, SD_BOTH);
             closesocket(clientSocket);
             clientSocket = INVALID_SOCKET;
         }
@@ -579,7 +650,7 @@ public:
     void SendChatMessage(const std::string& text) {
         if (clientSocket != INVALID_SOCKET && connected) {
             EnterCriticalSection(&cs);
-            NetworkHelper::SendPacket(clientSocket, MSG_CHAT_TEXT, (const void*)text.data(), text.size(), &crypto, sequence++);
+            NetworkHelper::SendPacket(clientSocket, MSG_CHAT_TEXT, (const void*)text.data(), text.size(), &crypto, sequence.fetch_add(1));
             LeaveCriticalSection(&cs);
         }
     }
@@ -640,8 +711,18 @@ public:
 
     void HandleFileListRequest(const FileListRequest& req) {
         FileListResponseHeader resp{};
-        std::string reqPath = req.path;
-        if (reqPath.empty()) reqPath = "C:\\";
+        std::string reqPath;
+        if (!ResolveRemotePath(req.path, reqPath)) {
+            FileOperationResult result{};
+            result.operation = MSG_FILE_LIST_REQ;
+            result.success = 0;
+            result.errorCode = ERROR_ACCESS_DENIED;
+            snprintf(result.path, sizeof(result.path), "%s", req.path);
+            EnterCriticalSection(&cs);
+            NetworkHelper::SendPacket(clientSocket, MSG_FILE_OPERATION_RESULT, &result, sizeof(result), &crypto, sequence.fetch_add(1));
+            LeaveCriticalSection(&cs);
+            return;
+        }
         snprintf(resp.path, sizeof(resp.path), "%s", reqPath.c_str());
 
         std::vector<FileItem> items;
@@ -659,6 +740,8 @@ public:
                 item.isDir = (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) ? 1 : 0;
                 item.size = ((uint64_t)fd.nFileSizeHigh << 32) | fd.nFileSizeLow;
                 item.lastModified = ((uint64_t)fd.ftLastWriteTime.dwHighDateTime << 32) | fd.ftLastWriteTime.dwLowDateTime;
+                if (items.size() >= 4096 || sizeof(FileListResponseHeader) +
+                    (items.size() + 1) * sizeof(FileItem) > RC_MAX_FILE_LIST_SIZE) break;
                 items.push_back(item);
             } while (FindNextFileA(hFind, &fd));
             FindClose(hFind);
@@ -673,23 +756,112 @@ public:
         }
 
         EnterCriticalSection(&cs);
-        NetworkHelper::SendPacket(clientSocket, MSG_FILE_LIST_RESP, payload.data(), payload.size(), &crypto, sequence++);
+        NetworkHelper::SendPacket(clientSocket, MSG_FILE_LIST_RESP, payload.data(), payload.size(), &crypto, sequence.fetch_add(1));
         LeaveCriticalSection(&cs);
     }
 
     void HandleFileDeleteRequest(const FileDeleteRequest& req) {
-        DWORD attr = GetFileAttributesA(req.path);
+        FileOperationResult result{};
+        result.operation = MSG_FILE_DELETE_REQ;
+        snprintf(result.path, sizeof(result.path), "%s", req.path);
+        std::string resolvedPath;
+        DWORD attr = ResolveRemotePath(req.path, resolvedPath) ? GetFileAttributesA(resolvedPath.c_str()) : INVALID_FILE_ATTRIBUTES;
+        bool success = false;
         if (attr != INVALID_FILE_ATTRIBUTES) {
             if (attr & FILE_ATTRIBUTE_DIRECTORY) {
-                RemoveDirectoryA(req.path);
+                success = RemoveDirectoryA(resolvedPath.c_str()) == TRUE;
             } else {
-                DeleteFileA(req.path);
+                success = DeleteFileA(resolvedPath.c_str()) == TRUE;
             }
         }
+        result.success = success ? 1 : 0;
+        result.errorCode = success ? ERROR_SUCCESS : (resolvedPath.empty() ? ERROR_ACCESS_DENIED : GetLastError());
+        EnterCriticalSection(&cs);
+        NetworkHelper::SendPacket(clientSocket, MSG_FILE_OPERATION_RESULT, &result, sizeof(result), &crypto, sequence.fetch_add(1));
+        LeaveCriticalSection(&cs);
     }
 
     void HandleFileMkdirRequest(const FileMkdirRequest& req) {
-        CreateDirectoryA(req.path, nullptr);
+        FileOperationResult result{};
+        result.operation = MSG_FILE_MKDIR_REQ;
+        snprintf(result.path, sizeof(result.path), "%s", req.path);
+        std::string resolvedPath;
+        bool success = ResolveRemotePath(req.path, resolvedPath) && CreateDirectoryA(resolvedPath.c_str(), nullptr) == TRUE;
+        result.success = success ? 1 : 0;
+        result.errorCode = success ? ERROR_SUCCESS : (resolvedPath.empty() ? ERROR_ACCESS_DENIED : GetLastError());
+        EnterCriticalSection(&cs);
+        NetworkHelper::SendPacket(clientSocket, MSG_FILE_OPERATION_RESULT, &result, sizeof(result), &crypto, sequence.fetch_add(1));
+        LeaveCriticalSection(&cs);
+    }
+
+    void HandleFileDownloadRequest(const FileDownloadRequest& req) {
+        std::string path;
+        if (!ResolveRemotePath(req.path, path)) {
+            FileOperationResult result{};
+            result.operation = MSG_FILE_DOWNLOAD_REQ;
+            result.success = 0;
+            result.errorCode = ERROR_ACCESS_DENIED;
+            snprintf(result.path, sizeof(result.path), "%s", req.path);
+            EnterCriticalSection(&cs);
+            NetworkHelper::SendPacket(clientSocket, MSG_FILE_OPERATION_RESULT, &result, sizeof(result), &crypto, sequence.fetch_add(1));
+            LeaveCriticalSection(&cs);
+            return;
+        }
+
+        DWORD attributes = GetFileAttributesA(path.c_str());
+        if (attributes == INVALID_FILE_ATTRIBUTES || (attributes & FILE_ATTRIBUTE_DIRECTORY)) return;
+
+        std::ifstream file(path.c_str(), std::ios::binary | std::ios::ate);
+        if (!file.is_open()) return;
+        std::streamoff size = file.tellg();
+        if (size < 0 || (uint64_t)size > RC_MAX_PACKET_SIZE * 1024ULL) return;
+        file.seekg(0, std::ios::beg);
+
+        uint8_t digest[32] = {};
+        if (!ComputeFileSHA256(path, digest)) return;
+
+        std::string fileName = SanitizeFileName(GetBaseFileName(path));
+        const uint32_t chunkSize = 32 * 1024;
+        const uint32_t transferId = (uint32_t)GetTickCount();
+        FileTransferBegin begin{};
+        begin.transferId = transferId ? transferId : 1;
+        begin.fileSize = (uint64_t)size;
+        begin.chunkSize = chunkSize;
+        memcpy(begin.sha256, digest, sizeof(begin.sha256));
+        snprintf(begin.fileName, sizeof(begin.fileName), "%s", fileName.c_str());
+
+        EnterCriticalSection(&cs);
+        bool ok = NetworkHelper::SendPacket(clientSocket, MSG_FILE_TRANSFER_BEGIN, &begin, sizeof(begin), &crypto, sequence.fetch_add(1));
+        LeaveCriticalSection(&cs);
+        if (!ok) return;
+
+        std::vector<uint8_t> buffer(chunkSize);
+        uint32_t chunkIndex = 0;
+        while (file) {
+            file.read((char*)buffer.data(), buffer.size());
+            std::streamsize count = file.gcount();
+            if (count <= 0) break;
+
+            std::vector<uint8_t> payload(sizeof(FileTransferChunkHeader) + (size_t)count);
+            FileTransferChunkHeader header{};
+            header.transferId = begin.transferId;
+            header.chunkIndex = chunkIndex++;
+            header.chunkSize = (uint32_t)count;
+            memcpy(payload.data(), &header, sizeof(header));
+            memcpy(payload.data() + sizeof(header), buffer.data(), (size_t)count);
+
+            EnterCriticalSection(&cs);
+            ok = NetworkHelper::SendPacket(clientSocket, MSG_FILE_TRANSFER_CHUNK, payload.data(), payload.size(), &crypto, sequence.fetch_add(1));
+            LeaveCriticalSection(&cs);
+            if (!ok) return;
+        }
+
+        FileTransferEnd end{};
+        end.transferId = begin.transferId;
+        end.status = file.eof() ? 0 : 1;
+        EnterCriticalSection(&cs);
+        NetworkHelper::SendPacket(clientSocket, MSG_FILE_TRANSFER_END, &end, sizeof(end), &crypto, sequence.fetch_add(1));
+        LeaveCriticalSection(&cs);
     }
 
     bool PerformHandshake() {
@@ -719,8 +891,8 @@ public:
         const auto& pubKey = crypto.GetPublicKey();
         ECDHKeyExchange keyEx;
         memset(&keyEx, 0, sizeof(keyEx));
-        memcpy(keyEx.publicKey, pubKey.data(), std::min(pubKey.size(), sizeof(keyEx.publicKey)));
-        keyEx.keyLength = (uint32_t)pubKey.size();
+        if (pubKey.size() != sizeof(keyEx.publicKey)) return false;
+        memcpy(keyEx.publicKey, pubKey.data(), sizeof(keyEx.publicKey));
 
         if (!NetworkHelper::SendPacket(clientSocket, MSG_HANDSHAKE_PUBKEY, &keyEx, sizeof(keyEx))) {
             Console::PrintError("Failed to send public key");
@@ -733,15 +905,14 @@ public:
             return false;
         }
 
-        if (header.type != MSG_HANDSHAKE_PUBKEY || payload.size() < sizeof(ECDHKeyExchange)) {
+        if (header.type != MSG_HANDSHAKE_PUBKEY || payload.size() != sizeof(ECDHKeyExchange)) {
             Console::PrintError("Invalid key exchange message");
             return false;
         }
 
         ECDHKeyExchange* viewerKey = (ECDHKeyExchange*)payload.data();
-
         // Derive shared secret
-        if (!crypto.DeriveSharedSecret(viewerKey->publicKey, viewerKey->keyLength)) {
+        if (!crypto.DeriveSharedSecret(viewerKey->publicKey, sizeof(viewerKey->publicKey))) {
             Console::PrintError("Failed to derive shared secret");
             return false;
         }
@@ -760,11 +931,12 @@ public:
         PacketHeader header;
         std::vector<uint8_t> payload;
 
-        if (!NetworkHelper::RecvPacket(clientSocket, header, payload, &crypto)) {
+        receiveSequence = 0;
+        if (!NetworkHelper::RecvPacket(clientSocket, header, payload, &crypto, &receiveSequence)) {
             return false;
         }
 
-        if (header.type != MSG_CONNECT_REQUEST) {
+        if (header.type != MSG_CONNECT_REQUEST || payload.size() != sizeof(ConnectRequest)) {
             return false;
         }
 
@@ -800,7 +972,7 @@ public:
         }
 
         if (accept) {
-            if (!NetworkHelper::SendPacket(clientSocket, MSG_CONNECT_ACCEPT, nullptr, 0, &crypto)) {
+            if (!NetworkHelper::SendPacket(clientSocket, MSG_CONNECT_ACCEPT, nullptr, 0, &crypto, sequence.fetch_add(1))) {
                 return false;
             }
             if (g_hAgentStatusLabel) {
@@ -809,7 +981,7 @@ public:
             }
             return true;
         } else {
-            NetworkHelper::SendPacket(clientSocket, MSG_CONNECT_REJECT, nullptr, 0, &crypto);
+            NetworkHelper::SendPacket(clientSocket, MSG_CONNECT_REJECT, nullptr, 0, &crypto, sequence.fetch_add(1));
             return false;
         }
     }
@@ -848,7 +1020,7 @@ public:
                 if (!currentClip.empty() && currentClip != lastAgentClip && currentClip.size() < 1000000) {
                     lastAgentClip = currentClip;
                     EnterCriticalSection(&cs);
-                    NetworkHelper::SendPacket(clientSocket, MSG_CLIPBOARD_TEXT, (const void*)currentClip.data(), currentClip.size(), &crypto, sequence++);
+                    NetworkHelper::SendPacket(clientSocket, MSG_CLIPBOARD_TEXT, (const void*)currentClip.data(), currentClip.size(), &crypto, sequence.fetch_add(1));
                     LeaveCriticalSection(&cs);
                 }
             }
@@ -892,7 +1064,7 @@ public:
             // Send encrypted frame with retry
             EnterCriticalSection(&cs);
             bool sent = NetworkHelper::SendPacket(clientSocket, MSG_FRAME_DATA, 
-                                                  packet.data(), packet.size(), &crypto, sequence++);
+                                                  packet.data(), packet.size(), &crypto, sequence.fetch_add(1));
             LeaveCriticalSection(&cs);
 
             if (!sent) {
@@ -934,7 +1106,7 @@ public:
             PacketHeader header;
             std::vector<uint8_t> payload;
 
-            if (!NetworkHelper::RecvPacket(clientSocket, header, payload, &crypto)) {
+            if (!NetworkHelper::RecvPacket(clientSocket, header, payload, &crypto, &receiveSequence)) {
                 errorCount++;
                 if (errorCount >= MAX_RECV_ERRORS) {
                     Console::PrintWarning("Connection appears lost");
@@ -945,11 +1117,11 @@ public:
             }
             errorCount = 0;  // Reset on successful recv
 
-            if (header.type == MSG_CONTROL_MOUSE && payload.size() >= sizeof(ControlPacket)) {
+            if (header.type == MSG_CONTROL_MOUSE && payload.size() == sizeof(ControlPacket)) {
                 ControlPacket* pkt = (ControlPacket*)payload.data();
                 input.HandleMouse(*pkt);
             }
-            else if (header.type == MSG_CONTROL_KEYBOARD && payload.size() >= sizeof(ControlPacket)) {
+            else if (header.type == MSG_CONTROL_KEYBOARD && payload.size() == sizeof(ControlPacket)) {
                 ControlPacket* pkt = (ControlPacket*)payload.data();
                 input.HandleKeyboard(*pkt);
             }
@@ -959,9 +1131,9 @@ public:
                 Console::PrintInfo("Updated clipboard from Viewer");
             }
             else if (header.type == MSG_PING) {
-                NetworkHelper::SendPacket(clientSocket, MSG_PONG, nullptr, 0, &crypto);
+                NetworkHelper::SendPacket(clientSocket, MSG_PONG, nullptr, 0, &crypto, sequence.fetch_add(1));
             }
-            else if (header.type == MSG_FILE_TRANSFER_REQ && payload.size() >= sizeof(FileTransferRequest)) {
+            else if (header.type == MSG_FILE_TRANSFER_REQ && payload.size() == sizeof(FileTransferRequest)) {
                 const FileTransferRequest* req = (const FileTransferRequest*)payload.data();
                 FileTransferResponse resp{};
                 resp.transferId = req->transferId;
@@ -972,14 +1144,15 @@ public:
                 begin.transferId = req->transferId;
                 begin.fileSize = req->fileSize;
                 begin.chunkSize = req->chunkSize;
+                memcpy(begin.sha256, req->sha256, sizeof(begin.sha256));
                 memcpy(begin.fileName, req->fileName, sizeof(begin.fileName));
-                HandleFileTransferBegin(begin);
+                resp.accepted = HandleFileTransferBegin(begin) ? 1 : 0;
 
                 EnterCriticalSection(&cs);
-                NetworkHelper::SendPacket(clientSocket, MSG_FILE_TRANSFER_ACK, &resp, sizeof(resp), &crypto, sequence++);
+                NetworkHelper::SendPacket(clientSocket, MSG_FILE_TRANSFER_ACK, &resp, sizeof(resp), &crypto, sequence.fetch_add(1));
                 LeaveCriticalSection(&cs);
             }
-            else if (header.type == MSG_FILE_TRANSFER_BEGIN && payload.size() >= sizeof(FileTransferBegin)) {
+            else if (header.type == MSG_FILE_TRANSFER_BEGIN && payload.size() == sizeof(FileTransferBegin)) {
                 const FileTransferBegin* begin = (const FileTransferBegin*)payload.data();
                 HandleFileTransferBegin(*begin);
             }
@@ -988,19 +1161,19 @@ public:
                 const uint8_t* chunkData = payload.data() + sizeof(FileTransferChunkHeader);
                 size_t chunkSize = payload.size() - sizeof(FileTransferChunkHeader);
 
-                if (chunkHeader->chunkSize <= chunkSize) {
-                    HandleFileTransferChunk(*chunkHeader, chunkData, chunkHeader->chunkSize);
+                if (chunkHeader->chunkSize == chunkSize) {
+                    bool accepted = HandleFileTransferChunk(*chunkHeader, chunkData, chunkSize);
                     FileTransferChunkAck ack{};
                     ack.transferId = chunkHeader->transferId;
                     ack.chunkIndex = chunkHeader->chunkIndex;
-                    ack.status = 1;
+                    ack.status = accepted ? 1 : 0;
 
                     EnterCriticalSection(&cs);
-                    NetworkHelper::SendPacket(clientSocket, MSG_FILE_TRANSFER_CHUNK_ACK, &ack, sizeof(ack), &crypto, sequence++);
+                    NetworkHelper::SendPacket(clientSocket, MSG_FILE_TRANSFER_CHUNK_ACK, &ack, sizeof(ack), &crypto, sequence.fetch_add(1));
                     LeaveCriticalSection(&cs);
                 }
             }
-            else if (header.type == MSG_FILE_TRANSFER_END && payload.size() >= sizeof(FileTransferEnd)) {
+            else if (header.type == MSG_FILE_TRANSFER_END && payload.size() == sizeof(FileTransferEnd)) {
                 const FileTransferEnd* end = (const FileTransferEnd*)payload.data();
                 HandleFileTransferEnd(*end);
             }
@@ -1012,21 +1185,25 @@ public:
                     delete pChatMsg;
                 }
             }
-            else if (header.type == MSG_SPECIAL_KEY && payload.size() >= sizeof(SpecialKeyPacket)) {
+            else if (header.type == MSG_SPECIAL_KEY && payload.size() == sizeof(SpecialKeyPacket)) {
                 SpecialKeyPacket* pkt = (SpecialKeyPacket*)payload.data();
                 HandleSpecialKey(pkt->keyCmd);
             }
-            else if (header.type == MSG_FILE_LIST_REQ && payload.size() >= sizeof(FileListRequest)) {
+            else if (header.type == MSG_FILE_LIST_REQ && payload.size() == sizeof(FileListRequest)) {
                 FileListRequest* req = (FileListRequest*)payload.data();
                 HandleFileListRequest(*req);
             }
-            else if (header.type == MSG_FILE_DELETE_REQ && payload.size() >= sizeof(FileDeleteRequest)) {
+            else if (header.type == MSG_FILE_DELETE_REQ && payload.size() == sizeof(FileDeleteRequest)) {
                 FileDeleteRequest* req = (FileDeleteRequest*)payload.data();
                 HandleFileDeleteRequest(*req);
             }
-            else if (header.type == MSG_FILE_MKDIR_REQ && payload.size() >= sizeof(FileMkdirRequest)) {
+            else if (header.type == MSG_FILE_MKDIR_REQ && payload.size() == sizeof(FileMkdirRequest)) {
                 FileMkdirRequest* req = (FileMkdirRequest*)payload.data();
                 HandleFileMkdirRequest(*req);
+            }
+            else if (header.type == MSG_FILE_DOWNLOAD_REQ && payload.size() == sizeof(FileDownloadRequest)) {
+                FileDownloadRequest* req = (FileDownloadRequest*)payload.data();
+                HandleFileDownloadRequest(*req);
             }
             else if (header.type == MSG_DISCONNECT) {
                 Console::PrintInfo("Viewer disconnected gracefully");
@@ -1445,6 +1622,7 @@ void ShowGuiAgentDashboard() {
 // ============================================================================
 
 int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow) {
+    InstallCrashDiagnostics();
     EnableDPIAwareness();
 
     std::string cmd(lpCmdLine ? lpCmdLine : "");

@@ -1,0 +1,10 @@
+# Build dependencies are managed by CMake, not Python.
+#
+# Required tools:
+# - CMake 3.20+
+# - C++17 compiler
+# - OpenSSL 3.x development package (libcrypto)
+# - Windows SDK for the Windows application targets
+#
+# Recommended dependency installation:
+#   vcpkg install openssl:x64-windows

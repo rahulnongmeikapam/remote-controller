@@ -1,167 +1,216 @@
-# 🖥️ Remote Controller
+# Remote Controller
 
-A secure, high-performance, native Win32 remote desktop application for Windows featuring pure GUI subsystems, 40 FPS low-latency video streaming, end-to-end encryption, Encrypted Live Text Chat, Dual-Pane Remote File Manager, and Windows UAC / Lock Screen elevation support.
-
-![Version](https://img.shields.io/badge/version-2.5.0-blue)
 ![Platform](https://img.shields.io/badge/platform-Windows-lightgrey)
-![License](https://img.shields.io/badge/license-MIT-green)
+![Language](https://img.shields.io/badge/language-C%2B%2B17-orange)
+![Crypto](https://img.shields.io/badge/crypto-OpenSSL%203.x-green)
 
----
+A native Windows remote administration application for authorized use. It includes a remote agent, viewer, background service monitor, authenticated sessions, screen streaming, input control, encrypted chat, and a sandboxed remote file manager.
 
-## ✨ Key Features
+> Use this software only on computers you own or are explicitly authorized to administer.
 
-### 🚀 Performance & Video Streaming Engine
-- **40 FPS Performance Engine** - High-precision 40 FPS locked rendering using `timeBeginPeriod(1)` OS timer resolution.
-- **Fast GDI Capture (`COLORONCOLOR`)** - Optimized screen capture completing in <1ms per frame.
-- **Dynamic Frame Differencing** - Skips unchanged frames to minimize CPU and network overhead.
-- **Instant Repainting** - Immediate viewer canvas updates via `RedrawWindow`.
+## What Is Included
 
-### 🛡️ Security & Authentication
-- **ECDH Key Exchange** - Curve P-256 key negotiation for session key derivation.
-- **AES-256-CBC Encryption** - All screen frames, input events, chat messages, and file operations are end-to-end encrypted.
-- **Unattended Access Password** - Configurable password protection for unattended remote access.
-- **Native GUI Connection Prompts** - Interactive `MessageBoxA` popups on the agent machine for one-click approval/rejection.
-- **IP Whitelisting & Hardware IDs** - Restrict connections to specific IP addresses and track unique hardware device IDs.
+| Executable | Purpose |
+|---|---|
+| `rc_agent.exe` | Runs on the remote computer and shares its screen, receives input, and handles remote operations. |
+| `rc_viewer.exe` | Runs on the operator computer and connects to the agent. |
+| `rc_service.exe` | Optional background monitor for unattended startup and agent launching. |
 
-### 💬 Encrypted Live Text Chat
-- **Bi-Directional Messaging** - Real-time live text chat between Viewer and Agent.
-- **Dedicated GUI Window** - Thread-safe GUI Chat dialogs (`WM_APP` message dispatching) with auto-open on incoming messages.
-- **Clean UI** - Emoji-free, clean professional interface.
+## Requirements
 
-### 📂 Dual-Pane Graphical Remote File Manager
-- **Side-by-Side Dual Pane Layout** - View Local Computer (Left Pane) and Remote Computer (Right Pane) files simultaneously.
-- **Directory Navigation** - Double-click folders to navigate drives or use `[ Up ]` button.
-- **File Transfer & Operations**:
-  - `[ Upload >> ]` - Send selected local files to the remote PC folder.
-  - `[ << Download ]` - Fetch selected remote files to the local PC folder.
-  - `[ Delete Remote ]` - Remove remote files or directories.
-  - `[ New Folder ]` - Create new directories on the remote host.
+- Windows 10 or Windows 11 recommended.
+- C++17 compiler: Visual Studio 2019+ or MinGW-w64.
+- CMake 3.20 or newer.
+- OpenSSL 3.x development package with `libcrypto`.
+- Git, if cloning from GitHub.
 
-### 🔑 Windows UAC & Lock Screen Live Control
-- **Real `Ctrl+Alt+Del` (SAS) Trigger** - 5-stage multi-strategy pipeline utilizing Windows `sas.dll` (`SendSAS`), Registry `SoftwareSASGeneration` policy configuration, and keyboard fallback.
-- **Lock Screen Live Feed Streaming** - Dynamically attaches to `OpenInputDesktop` / `Winlogon` desktop context with `SRCCOPY | CAPTUREBLT` GDI capture and `CreateDCA("DISPLAY")` fallback. Stream and interact with the remote PC even when locked on the Windows logon screen or UAC elevation prompts.
-- **Session Control Bar** - Instant action buttons at the top of the session window: **Chat**, **Files**, **Ctrl+Alt+Del**, **Lock PC**, and **TaskMgr**.
+### Recommended Windows setup with vcpkg
 
-### 🎨 Pure Win32 GUI Subsystem (`-mwindows`)
-- **Zero Command Prompt Windows** - Compiles under `-mwindows` / `/SUBSYSTEM:WINDOWS`. Both Agent and Viewer run as native Win32 GUI applications.
-- **Graphical Connection Launcher** - Viewer dialog with Saved Contacts list, IP/Port fields, Password field, and Quick Connect button.
-- **Agent Control Dashboard** - Agent dashboard displaying Port, Quality Scale, Unattended Toggle & Password, Status Badge, Live Chat button, and Disconnect button.
-
----
-
-## 📦 Components
-
-| Executable | Description |
-|------------|-------------|
-| `rc_agent.exe` | Native GUI server app running on the **remote PC** to share screen and accept connections |
-| `rc_viewer.exe` | Native GUI client app running on **your PC** to view, control, chat, and transfer files |
-| `rc_service.exe` | Background service monitor to auto-start agent and handle unattended startup |
-
----
-
-## 🚀 Quick Start
-
-### Building from Source
-
-**Option 1: MinGW-w64 (Recommended)**
 ```cmd
-build_mingw.bat
+git clone https://github.com/microsoft/vcpkg.git C:\vcpkg
+C:\vcpkg\bootstrap-vcpkg.bat
+C:\vcpkg\vcpkg.exe install openssl:x64-windows
 ```
 
-**Option 2: Visual Studio Developer Command Prompt (MSVC)**
+You may use another OpenSSL installation. Set `OPENSSL_ROOT_DIR` to the directory containing the OpenSSL `include` and `lib` folders.
+
+## Quick Build
+
+Open Command Prompt in this repository and run:
+
 ```cmd
 build.bat
 ```
 
-### Basic Usage
+The script automatically detects a standard vcpkg installation at `C:\Users\<username>\vcpkg`. For another vcpkg location:
 
-1. **On the Remote Computer (`rc_agent.exe`)**:
-   - Double-click `rc_agent.exe` to launch the **Agent Control Dashboard**.
-   - Configure Port (default: `5000`), Quality Scale, and optional Unattended Access Password.
-   - Click **Start Agent Server**.
-
-2. **On Your Local Computer (`rc_viewer.exe`)**:
-   - Double-click `rc_viewer.exe` to launch the **GUI Connection Launcher**.
-   - Enter the Remote PC's IP address, Port, and Password (if unattended access is enabled).
-   - Click **Connect to Agent**.
-
----
-
-## ⚙️ Configuration Parameters
-
-### Agent Dashboard Options
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| Port | `5000` | TCP listening port |
-| Quality Scale | Medium (50%) | Screen capture scale factor (25%, 50%, 75%, 100%) |
-| Unattended Access | Disabled | Auto-accept connections with password verification |
-| Unattended Password | None | Secret passphrase required for unattended connection |
-
-### Viewer Settings
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| Target FPS | 40 FPS | Locked frame rate for smooth remote viewing |
-| JPEG Quality | 75 | Image compression quality (1-100) |
-| Connect Password | None | Password sent during handshake for unattended access |
-
----
-
-## 🔒 Security Architecture
-
-```
-┌─────────────┐                           ┌─────────────┐
-│   VIEWER    │                           │    AGENT    │
-├─────────────┤                           ├─────────────┤
-│ Generate    │──── Handshake Init ──────>│             │
-│ ECDH Keys   │                           │ Generate    │
-│             │<─── Agent Public Key ─────│ ECDH Keys   │
-│             │──── Viewer Public Key ───>│             │
-│             │                           │             │
-│ Derive      │                           │ Derive      │
-│ AES-256 Key │                           │ AES-256 Key │
-│             │<─── Handshake OK ─────────│             │
-├─────────────┤                           ├─────────────┤
-│             │═══ Encrypted Channel ═════│             │
-│  Send       │──── Control & Commands ──>│  Execute    │
-│  Packets    │<─── Video & Responses ────│  Capture    │
-└─────────────┘                           └─────────────┘
+```cmd
+set VCPKG_ROOT=C:\vcpkg
+build.bat
 ```
 
----
+For a manually installed OpenSSL directory:
 
-## ⌨️ Keyboard Shortcuts & Controls
+```cmd
+set OPENSSL_ROOT_DIR=C:\Program Files\OpenSSL-Win64
+build.bat
+```
 
-### Viewer Session Window
-| Control / Button | Action |
-|------------------|--------|
-| `Chat` Button | Open Encrypted Live Text Chat window |
-| `Files` Button | Open Dual-Pane Remote File Manager window |
-| `Ctrl+Alt+Del` Button | Issue Secure Attention Sequence (`SendSAS`) |
-| `Lock PC` Button | Instantly lock remote workstation (`Win+L`) |
-| `TaskMgr` Button | Launch Windows Task Manager (`taskmgr.exe`) |
-| `F11` | Toggle Fullscreen mode |
-| `ESC` | Exit Fullscreen mode |
-| Drag & Drop Files | Drag files onto session window to upload |
+The build creates:
 
----
+```text
+build\Release\rc_agent.exe
+build\Release\rc_viewer.exe
+build\Release\rc_service.exe
+build\Release\remote_crypto_tests.exe
+```
 
-## 📋 Requirements
+The script also runs the crypto test suite automatically.
 
-- **OS**: Windows 7 / 8.1 / 10 / 11 (Windows 10/11 recommended)
-- **Compiler**: MinGW-w64 (GCC 6.3+) or Visual Studio 2019+
-- **Libraries**: Winsock (`Ws2_32`), CNG (`Bcrypt`), GDI (`Gdi32`), Winmm (`Winmm`)
+## Manual CMake Build
 
----
+### Visual Studio
 
-## 📄 License
+```cmd
+cmake -S . -B build -DBUILD_TESTING=ON ^
+  -DCMAKE_TOOLCHAIN_FILE=C:\vcpkg\scripts\buildsystems\vcpkg.cmake ^
+  -DOPENSSL_ROOT_DIR=C:\vcpkg\installed\x64-windows
+cmake --build build --config Release
+ctest --test-dir build -C Release --output-on-failure
+```
 
-You are free to use, modify, distribute, and adapt this work for educational purposes, academic submissions, or final-year projects, provided the original copyright and permission notice are preserved.
+### MinGW
 
-## 👤 Author & Support
+Use a MinGW terminal with OpenSSL development files available:
 
-If you run into any issues or have questions, feel free to reach out at **mohit@mohitpatel.work**.
+```cmd
+cmake -G "MinGW Makefiles" -S . -B build-mingw -DBUILD_TESTING=ON ^
+  -DOPENSSL_ROOT_DIR=C:\path\to\openssl
+cmake --build build-mingw
+ctest --test-dir build-mingw --output-on-failure
+```
 
----
+## Running the Application
 
-**⚠️ Disclaimer**: This software is intended for legitimate remote administration of your own computers. Always obtain proper authorization before accessing any computer remotely.
+### Agent
 
+1. Run `build\Release\rc_agent.exe` on the remote computer.
+2. Choose the capture scale and JPEG quality.
+3. Set the listening port, default `5000`.
+4. Start the agent server.
+5. Allow the application through the Windows Firewall when prompted.
+
+### Viewer
+
+1. Run `build\Release\rc_viewer.exe` on the operator computer.
+2. Enter the agent IP address and port.
+3. Connect and approve the request on the agent when interactive approval is enabled.
+
+Command-line connection:
+
+```cmd
+rc_viewer.exe <agent-ip> [port]
+```
+
+### Service monitor
+
+```cmd
+build\Release\rc_service.exe
+build\Release\rc_service.exe --service
+```
+
+## Features
+
+- GDI screen capture with JPEG encoding and frame-difference skipping.
+- Mouse and keyboard control.
+- Encrypted chat and clipboard exchange.
+- Dual-pane remote file manager.
+- Upload and download with size, order, and SHA-256 verification.
+- Remote file access restricted to `C:\RemoteControllerShare`.
+- Delete and directory creation results with Windows error codes.
+- Atomic session state and coordinated thread shutdown.
+- Packet size limits and sequence/replay validation.
+
+## Security Design
+
+The active crypto implementation is in `common/crypto/` and uses OpenSSL 3.x:
+
+```text
+ECDH P-256
+    -> HKDF-SHA256
+    -> separate client-to-agent and agent-to-client keys
+    -> AES-256-GCM
+```
+
+The handshake exchanges a standard 65-byte uncompressed P-256 public point:
+
+```text
+04 || X (32 bytes) || Y (32 bytes)
+```
+
+Encrypted packets contain:
+
+```text
+12-byte nonce || ciphertext || 16-byte authentication tag
+```
+
+Packet headers are authenticated as AES-GCM AAD. Authentication failures reject packets before application processing.
+
+## Repository Layout
+
+```text
+apps/                  Windows agent, viewer, and service applications
+common/protocol/       Shared packet protocol and networking
+common/crypto/         Platform-independent OpenSSL crypto module
+tests/                 Crypto tests
+third_party/stb/       Image codec dependencies
+CMakeLists.txt         CMake build definition
+build.bat              One-command Windows build and test script
+```
+
+## Troubleshooting
+
+### `CMake was not found`
+
+Install CMake 3.20 or newer and add it to `PATH`.
+
+### `Could NOT find OpenSSL`
+
+Install OpenSSL 3.x development files or vcpkg OpenSSL:
+
+```cmd
+C:\vcpkg\vcpkg.exe install openssl:x64-windows
+set VCPKG_ROOT=C:\vcpkg
+build.bat
+```
+
+### `bcrypt.dll` errors
+
+The active GitHub package no longer uses Windows CNG or CryptoAPI for application cryptography. Check that the OpenSSL 3.x `libcrypto` runtime DLL is available beside the executable or on `PATH`.
+
+### Firewall or connection failure
+
+- Confirm the agent is listening on the configured port.
+- Use the correct IP address.
+- Allow the executable through Windows Firewall.
+- Verify both computers can reach each other over TCP.
+
+### Build logs
+
+Use verbose CMake output:
+
+```cmd
+cmake --build build --config Release --verbose
+```
+
+## Limitations
+
+- Windows GUI, screen capture, input, and service features are Windows-specific.
+- Linux crypto preparation is provided through the OpenSSL module, but the full GUI application is not yet a Linux application.
+- File resume, transfer progress, cancellation, and persistent checkpoints are not implemented.
+- Multi-monitor capture and coordinate mapping are incomplete.
+- The service monitor is not a native Windows Service implementation.
+
+## License and Authorization
+
+Preserve the project license and permission notice when redistributing this software. Always obtain authorization before accessing another computer.

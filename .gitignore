@@ -1,0 +1,34 @@
+# CMake output
+/build/
+/build-*/
+/CMakeFiles/
+/CMakeCache.txt
+cmake_install.cmake
+Makefile
+*.sln
+*.vcxproj
+*.vcxproj.filters
+*.vcxproj.user
+
+# Compiled binaries and intermediates
+*.exe
+*.dll
+*.lib
+*.obj
+*.o
+*.pdb
+*.ilk
+
+# Runtime and build logs
+*.log
+remote_controller_crash.log
+received_files/
+
+# IDE files
+.vs/
+.vscode/
+.idea/
+
+# Temporary files
+*.tmp
+*.user

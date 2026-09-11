@@ -64,7 +64,7 @@ private:
     SOCKET sock = INVALID_SOCKET;
     SecureChannel* crypto = nullptr;
     std::function<void(const std::vector<std::string>&)> dropHandler;
-    uint32_t sequence = 0;
+    std::atomic<uint32_t>* sequence = nullptr;
 
     // Window state
     int windowWidth = 1280;
@@ -84,6 +84,7 @@ public:
 
     void SetSocket(SOCKET s) { sock = s; }
     void SetCrypto(SecureChannel* c) { crypto = c; }
+    void SetSequenceCounter(std::atomic<uint32_t>* counter) { sequence = counter; }
     void SetDropHandler(const std::function<void(const std::vector<std::string>&)>& handler) { dropHandler = handler; }
     HWND GetHWnd() const { return hWnd; }
 
@@ -145,7 +146,7 @@ public:
         pkt.y = imgY;
         pkt.scrollDelta = scrollDelta;
 
-        NetworkHelper::SendPacket(sock, MSG_CONTROL_MOUSE, &pkt, sizeof(pkt), crypto, sequence++);
+        if (sequence) NetworkHelper::SendPacket(sock, MSG_CONTROL_MOUSE, &pkt, sizeof(pkt), crypto, sequence->fetch_add(1));
     }
 
     void SendKeyEvent(uint16_t vk, bool down) {
@@ -156,7 +157,7 @@ public:
         pkt.vk = vk;
         pkt.keyDown = down ? 1 : 0;
 
-        NetworkHelper::SendPacket(sock, MSG_CONTROL_KEYBOARD, &pkt, sizeof(pkt), crypto, sequence++);
+        if (sequence) NetworkHelper::SendPacket(sock, MSG_CONTROL_KEYBOARD, &pkt, sizeof(pkt), crypto, sequence->fetch_add(1));
     }
 
     void ToggleFullscreen() {
@@ -374,8 +375,11 @@ public:
             if (pData && pData->size() >= sizeof(FileListResponseHeader)) {
                 FileListResponseHeader* hdr = (FileListResponseHeader*)pData->data();
                 uint32_t count = hdr->itemCount;
-                FileItem* items = (FileItem*)(pData->data() + sizeof(FileListResponseHeader));
-                UpdateRemoteFileListInUI(hdr->path, items, count);
+                size_t available = pData->size() - sizeof(FileListResponseHeader);
+                if (count <= 4096 && count <= available / sizeof(FileItem)) {
+                    FileItem* items = (FileItem*)(pData->data() + sizeof(FileListResponseHeader));
+                    UpdateRemoteFileListInUI(hdr->path, items, count);
+                }
                 delete pData;
             }
             return 0;
@@ -591,13 +595,23 @@ public:
 
 class ViewerClient {
 private:
+    struct ActiveDownload {
+        uint32_t transferId = 0;
+        uint32_t expectedChunkIndex = 0;
+        uint64_t expectedSize = 0;
+        uint64_t receivedSize = 0;
+        uint8_t expectedSHA256[32] = {};
+        std::string path;
+        std::ofstream stream;
+    } download;
     SOCKET sock = INVALID_SOCKET;
-    SecureChannel crypto;
+    SecureChannel crypto{true};
     ViewerWindow window;
     HANDLE recvThread = nullptr;
-    bool running = false;
+    std::atomic<bool> running{false};
     bool reconnectRecommended = false;
-    uint32_t sequence = 0;
+    std::atomic<uint32_t> sequence{0};
+    uint32_t receiveSequence = 0;
     uint32_t nextTransferId = 1;
     ContactManager contacts;
     CRITICAL_SECTION cs;
@@ -661,6 +675,8 @@ public:
             Console::PrintError("Failed to initialize encryption");
             return false;
         }
+        sequence.store(0);
+        receiveSequence = 0;
 
         // Send handshake init
         HandshakeInit init{};
@@ -682,7 +698,7 @@ public:
             return false;
         }
 
-        if (header.type != MSG_HANDSHAKE_PUBKEY || payload.size() < sizeof(ECDHKeyExchange)) {
+        if (header.type != MSG_HANDSHAKE_PUBKEY || payload.size() != sizeof(ECDHKeyExchange)) {
             Console::PrintError("Invalid handshake response");
             return false;
         }
@@ -693,8 +709,8 @@ public:
         const auto& pubKey = crypto.GetPublicKey();
         ECDHKeyExchange keyEx;
         memset(&keyEx, 0, sizeof(keyEx));
-        memcpy(keyEx.publicKey, pubKey.data(), std::min(pubKey.size(), sizeof(keyEx.publicKey)));
-        keyEx.keyLength = (uint32_t)pubKey.size();
+        if (pubKey.size() != sizeof(keyEx.publicKey)) return false;
+        memcpy(keyEx.publicKey, pubKey.data(), sizeof(keyEx.publicKey));
 
         if (!NetworkHelper::SendPacket(sock, MSG_HANDSHAKE_PUBKEY, &keyEx, sizeof(keyEx))) {
             Console::PrintError("Failed to send public key");
@@ -702,7 +718,7 @@ public:
         }
 
         // Derive shared secret
-        if (!crypto.DeriveSharedSecret(agentKey->publicKey, agentKey->keyLength)) {
+        if (!crypto.DeriveSharedSecret(agentKey->publicKey, sizeof(agentKey->publicKey))) {
             Console::PrintError("Failed to derive shared secret");
             return false;
         }
@@ -733,7 +749,7 @@ public:
         req.requestedFPS = g_viewerConfig.requestedFPS;
         req.quality = (uint8_t)g_viewerConfig.jpegQuality;
 
-        if (!NetworkHelper::SendPacket(sock, MSG_CONNECT_REQUEST, &req, sizeof(req), &crypto)) {
+        if (!NetworkHelper::SendPacket(sock, MSG_CONNECT_REQUEST, &req, sizeof(req), &crypto, sequence.fetch_add(1))) {
             Console::PrintError("Failed to send connection request");
             return false;
         }
@@ -742,7 +758,7 @@ public:
         PacketHeader header;
         std::vector<uint8_t> payload;
 
-        if (!NetworkHelper::RecvPacket(sock, header, payload, &crypto)) {
+        if (!NetworkHelper::RecvPacket(sock, header, payload, &crypto, &receiveSequence)) {
             Console::PrintError("No response from agent");
             return false;
         }
@@ -780,6 +796,12 @@ public:
         uint64_t fileSize = (uint64_t)sizePos;
         file.seekg(0, std::ios::beg);
 
+        uint8_t sha256[32] = {};
+        if (!ComputeFileSHA256(filePath, sha256)) {
+            Console::PrintError("Failed to calculate file digest: " + filePath);
+            return false;
+        }
+
         std::string fileName = SanitizeFileName(GetBaseFileName(filePath));
         if (fileName.empty()) fileName = "file.bin";
 
@@ -792,9 +814,10 @@ public:
         begin.transferId = transferId;
         begin.fileSize = fileSize;
         begin.chunkSize = chunkSize;
+        memcpy(begin.sha256, sha256, sizeof(begin.sha256));
         std::snprintf(begin.fileName, sizeof(begin.fileName), "%s", fileName.c_str());
 
-        if (!NetworkHelper::SendPacket(sock, MSG_FILE_TRANSFER_BEGIN, &begin, sizeof(begin), &crypto, sequence++)) {
+        if (!NetworkHelper::SendPacket(sock, MSG_FILE_TRANSFER_BEGIN, &begin, sizeof(begin), &crypto, sequence.fetch_add(1))) {
             Console::PrintError("Failed to send file transfer header");
             return false;
         }
@@ -819,7 +842,7 @@ public:
             memcpy(payload.data(), &chunkHeader, sizeof(chunkHeader));
             memcpy(payload.data() + sizeof(chunkHeader), buffer.data(), (size_t)chunkBytes);
 
-            if (!NetworkHelper::SendPacket(sock, MSG_FILE_TRANSFER_CHUNK, payload.data(), payload.size(), &crypto, sequence++)) {
+            if (!NetworkHelper::SendPacket(sock, MSG_FILE_TRANSFER_CHUNK, payload.data(), payload.size(), &crypto, sequence.fetch_add(1))) {
                 Console::PrintError("Failed while sending file chunk");
                 return false;
             }
@@ -830,7 +853,7 @@ public:
         FileTransferEnd end{};
         end.transferId = transferId;
         end.status = 0;
-        NetworkHelper::SendPacket(sock, MSG_FILE_TRANSFER_END, &end, sizeof(end), &crypto, sequence++);
+        NetworkHelper::SendPacket(sock, MSG_FILE_TRANSFER_END, &end, sizeof(end), &crypto, sequence.fetch_add(1));
 
         Console::PrintSuccess("File sent: " + fileName);
         return true;
@@ -865,7 +888,7 @@ public:
             PacketHeader header;
             std::vector<uint8_t> payload;
 
-            if (!NetworkHelper::RecvPacket(sock, header, payload, &crypto)) {
+            if (!NetworkHelper::RecvPacket(sock, header, payload, &crypto, &receiveSequence)) {
                 errorCount++;
                 if (errorCount >= MAX_RECV_ERRORS) {
                     Console::PrintError("Connection lost after " + std::to_string(errorCount) + " failures");
@@ -882,6 +905,11 @@ public:
                 uint8_t* jpegData = payload.data() + sizeof(FrameHeader);
                 size_t jpegSize = payload.size() - sizeof(FrameHeader);
 
+                if (fh->dataSize != jpegSize || fh->width == 0 || fh->height == 0 ||
+                    fh->dataSize > RC_MAX_PACKET_SIZE) {
+                    continue;
+                }
+
                 window.UpdateFrame(jpegData, jpegSize, fh->width, fh->height, fh->scale);
             }
             else if (header.type == MSG_PONG) {
@@ -894,6 +922,52 @@ public:
             else if (header.type == MSG_FILE_LIST_RESP && payload.size() >= sizeof(FileListResponseHeader)) {
                 std::vector<uint8_t>* pData = new std::vector<uint8_t>(payload);
                 PostMessageA(window.GetHWnd(), WM_APP + 11, 0, (LPARAM)pData);
+            }
+            else if (header.type == MSG_FILE_OPERATION_RESULT && payload.size() == sizeof(FileOperationResult)) {
+                const FileOperationResult* result = (const FileOperationResult*)payload.data();
+                if (result->success) {
+                    Console::PrintSuccess("Remote file operation completed: " + std::string(result->path));
+                } else {
+                    Console::PrintError("Remote file operation failed for " + std::string(result->path) +
+                                        " (Windows error " + std::to_string(result->errorCode) + ")");
+                }
+            }
+            else if (header.type == MSG_FILE_TRANSFER_BEGIN && payload.size() == sizeof(FileTransferBegin)) {
+                const FileTransferBegin* begin = (const FileTransferBegin*)payload.data();
+                if (download.stream.is_open()) download.stream.close();
+                download.transferId = begin->transferId;
+                download.expectedChunkIndex = 0;
+                download.expectedSize = begin->fileSize;
+                download.receivedSize = 0;
+                memcpy(download.expectedSHA256, begin->sha256, sizeof(download.expectedSHA256));
+                download.stream.open(download.path.c_str(), std::ios::binary | std::ios::trunc);
+            }
+            else if (header.type == MSG_FILE_TRANSFER_CHUNK && payload.size() >= sizeof(FileTransferChunkHeader)) {
+                const FileTransferChunkHeader* chunk = (const FileTransferChunkHeader*)payload.data();
+                size_t dataSize = payload.size() - sizeof(FileTransferChunkHeader);
+                if (download.stream.is_open() && chunk->transferId == download.transferId &&
+                    chunk->chunkIndex == download.expectedChunkIndex && chunk->chunkSize == dataSize &&
+                    dataSize <= RC_MAX_FILE_CHUNK_SIZE &&
+                    dataSize <= download.expectedSize - std::min(download.receivedSize, download.expectedSize)) {
+                    download.stream.write((const char*)payload.data() + sizeof(FileTransferChunkHeader), (std::streamsize)dataSize);
+                    if (download.stream.good()) {
+                        download.receivedSize += dataSize;
+                        download.expectedChunkIndex++;
+                    }
+                }
+            }
+            else if (header.type == MSG_FILE_TRANSFER_END && payload.size() == sizeof(FileTransferEnd)) {
+                const FileTransferEnd* end = (const FileTransferEnd*)payload.data();
+                if (download.stream.is_open()) download.stream.close();
+                uint8_t actualSHA256[32] = {};
+                bool valid = end->transferId == download.transferId && end->status == 0 &&
+                    download.receivedSize == download.expectedSize &&
+                    ComputeFileSHA256(download.path, actualSHA256) &&
+                    memcmp(actualSHA256, download.expectedSHA256, sizeof(actualSHA256)) == 0;
+                if (!valid) DeleteFileA(download.path.c_str());
+                Console::PrintStatus(valid ? "Download completed: " + download.path : "Download failed: integrity or size check failed",
+                                     valid ? Console::GREEN : Console::RED);
+                download = ActiveDownload();
             }
             else if (header.type == MSG_DISCONNECT) {
                 Console::PrintInfo("Agent disconnected gracefully");
@@ -910,15 +984,19 @@ public:
         running = false;
 
         if (sock != INVALID_SOCKET) {
-            NetworkHelper::SendPacket(sock, MSG_DISCONNECT, nullptr, 0, &crypto);
-            closesocket(sock);
-            sock = INVALID_SOCKET;
+            NetworkHelper::SendPacket(sock, MSG_DISCONNECT, nullptr, 0, &crypto, sequence.fetch_add(1));
+            shutdown(sock, SD_BOTH);
         }
 
         if (recvThread) {
-            WaitForSingleObject(recvThread, 2000);
+            WaitForSingleObject(recvThread, INFINITE);
             CloseHandle(recvThread);
             recvThread = nullptr;
+        }
+
+        if (sock != INVALID_SOCKET) {
+            closesocket(sock);
+            sock = INVALID_SOCKET;
         }
 
         crypto.Cleanup();
@@ -930,7 +1008,7 @@ public:
             SpecialKeyPacket pkt{};
             pkt.keyCmd = keyCmd;
             EnterCriticalSection(&cs);
-            NetworkHelper::SendPacket(sock, MSG_SPECIAL_KEY, &pkt, sizeof(pkt), &crypto, sequence++);
+            NetworkHelper::SendPacket(sock, MSG_SPECIAL_KEY, &pkt, sizeof(pkt), &crypto, sequence.fetch_add(1));
             LeaveCriticalSection(&cs);
         }
     }
@@ -938,7 +1016,7 @@ public:
     void SendChatMessage(const std::string& text) {
         if (sock != INVALID_SOCKET) {
             EnterCriticalSection(&cs);
-            NetworkHelper::SendPacket(sock, MSG_CHAT_TEXT, (const void*)text.data(), text.size(), &crypto, sequence++);
+            NetworkHelper::SendPacket(sock, MSG_CHAT_TEXT, (const void*)text.data(), text.size(), &crypto, sequence.fetch_add(1));
             LeaveCriticalSection(&cs);
         }
     }
@@ -948,7 +1026,7 @@ public:
             FileListRequest req{};
             snprintf(req.path, sizeof(req.path), "%s", path.c_str());
             EnterCriticalSection(&cs);
-            NetworkHelper::SendPacket(sock, MSG_FILE_LIST_REQ, &req, sizeof(req), &crypto, sequence++);
+            NetworkHelper::SendPacket(sock, MSG_FILE_LIST_REQ, &req, sizeof(req), &crypto, sequence.fetch_add(1));
             LeaveCriticalSection(&cs);
         }
     }
@@ -958,7 +1036,7 @@ public:
             FileDeleteRequest req{};
             snprintf(req.path, sizeof(req.path), "%s", path.c_str());
             EnterCriticalSection(&cs);
-            NetworkHelper::SendPacket(sock, MSG_FILE_DELETE_REQ, &req, sizeof(req), &crypto, sequence++);
+            NetworkHelper::SendPacket(sock, MSG_FILE_DELETE_REQ, &req, sizeof(req), &crypto, sequence.fetch_add(1));
             LeaveCriticalSection(&cs);
         }
     }
@@ -968,9 +1046,22 @@ public:
             FileMkdirRequest req{};
             snprintf(req.path, sizeof(req.path), "%s", path.c_str());
             EnterCriticalSection(&cs);
-            NetworkHelper::SendPacket(sock, MSG_FILE_MKDIR_REQ, &req, sizeof(req), &crypto, sequence++);
+            NetworkHelper::SendPacket(sock, MSG_FILE_MKDIR_REQ, &req, sizeof(req), &crypto, sequence.fetch_add(1));
             LeaveCriticalSection(&cs);
         }
+    }
+
+    void RequestRemoteFileDownload(const std::string& remotePath, const std::string& localDirectory) {
+        if (sock == INVALID_SOCKET || !crypto.IsReady()) return;
+        FileDownloadRequest req{};
+        snprintf(req.path, sizeof(req.path), "%s", remotePath.c_str());
+        download.path = localDirectory;
+        if (download.path.empty()) download.path = ".";
+        if (download.path.back() != '\\' && download.path.back() != '/') download.path += '\\';
+        download.path += SanitizeFileName(GetBaseFileName(remotePath));
+        EnterCriticalSection(&cs);
+        NetworkHelper::SendPacket(sock, MSG_FILE_DOWNLOAD_REQ, &req, sizeof(req), &crypto, sequence.fetch_add(1));
+        LeaveCriticalSection(&cs);
     }
 
     void Run() {
@@ -988,6 +1079,7 @@ public:
 
         window.SetSocket(sock);
         window.SetCrypto(&crypto);
+        window.SetSequenceCounter(&sequence);
         window.SetDropHandler([this](const std::vector<std::string>& files) {
             this->HandleDroppedFiles(files);
         });
@@ -1422,7 +1514,7 @@ static HWND g_hFmRemotePath = nullptr;
 static HWND g_hFmRemoteList = nullptr;
 
 static std::string g_currentLocalPath = "C:\\";
-static std::string g_currentRemotePath = "C:\\";
+static std::string g_currentRemotePath = "C:\\RemoteControllerShare";
 
 void PopulateLocalFileList(const std::string& path) {
     g_currentLocalPath = path;
@@ -1583,6 +1675,25 @@ static LRESULT CALLBACK FileManagerProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
                     if (g_pViewerClient) {
                         g_pViewerClient->SendFile(fullLocalPath);
                         g_pViewerClient->RequestRemoteFileList(g_currentRemotePath);
+                    }
+                }
+            }
+            return 0;
+        }
+
+        if (id == IDC_FM_BTN_DNLOAD) {
+            int sel = (int)SendMessage(g_hFmRemoteList, LB_GETCURSEL, 0, 0);
+            if (sel != LB_ERR) {
+                char text[256] = {0};
+                SendMessageA(g_hFmRemoteList, LB_GETTEXT, sel, (LPARAM)text);
+                std::string nameStr(text);
+                if (nameStr.rfind("[DIR] ", 0) != 0) {
+                    std::string fileName = nameStr.substr(6);
+                    std::string fullRemotePath = g_currentRemotePath;
+                    if (fullRemotePath.back() != '\\' && fullRemotePath.back() != '/') fullRemotePath += '\\';
+                    fullRemotePath += fileName;
+                    if (g_pViewerClient) {
+                        g_pViewerClient->RequestRemoteFileDownload(fullRemotePath, g_currentLocalPath);
                     }
                 }
             }
@@ -1819,6 +1930,7 @@ bool ShowGuiConnectionDialog() {
 // ============================================================================
 
 int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow) {
+    InstallCrashDiagnostics();
     EnableDPIAwareness();
 
     int argc = 0;

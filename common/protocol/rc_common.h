@@ -5,12 +5,17 @@
  */
 
 #pragma once
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #define _WIN32_WINNT 0x0601
 
-#include <windows.h>
-#include <wincrypt.h>
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <windows.h>
 #if defined(__has_include)
 #if __has_include(<mstcpip.h>)
 #include <mstcpip.h>
@@ -30,6 +35,9 @@
 #include <cctype>
 #include <cstdio>
 #include <functional>
+#include <atomic>
+#include <cstdlib>
+#include "../crypto/Crypto.h"
 
 #pragma comment(lib, "Ws2_32.lib")
 #pragma comment(lib, "Advapi32.lib")
@@ -170,6 +178,59 @@ namespace Console {
     }
 }
 
+inline LONG WINAPI RemoteControllerUnhandledExceptionFilter(EXCEPTION_POINTERS* exceptionInfo) {
+    const DWORD exceptionCode = exceptionInfo && exceptionInfo->ExceptionRecord
+        ? exceptionInfo->ExceptionRecord->ExceptionCode : 0;
+    const ULONG_PTR exceptionAddress = exceptionInfo && exceptionInfo->ExceptionRecord
+        ? (ULONG_PTR)exceptionInfo->ExceptionRecord->ExceptionAddress : 0;
+
+    char modulePath[MAX_PATH] = {};
+    GetModuleFileNameA(nullptr, modulePath, sizeof(modulePath));
+    char faultModule[MAX_PATH] = "unknown";
+    HMODULE faultModuleHandle = nullptr;
+    MEMORY_BASIC_INFORMATION memoryInfo{};
+    if (exceptionAddress && VirtualQuery((LPCVOID)exceptionAddress, &memoryInfo, sizeof(memoryInfo)) &&
+        memoryInfo.AllocationBase) {
+        faultModuleHandle = (HMODULE)memoryInfo.AllocationBase;
+        GetModuleFileNameA(faultModuleHandle, faultModule, sizeof(faultModule));
+    }
+
+    void* stack[16] = {};
+    typedef USHORT (WINAPI* CaptureStackBackTraceFn)(DWORD, DWORD, void**, PDWORD);
+    HMODULE kernel32 = GetModuleHandleA("kernel32.dll");
+    CaptureStackBackTraceFn captureStack = kernel32
+        ? reinterpret_cast<CaptureStackBackTraceFn>(GetProcAddress(kernel32, "RtlCaptureStackBackTrace"))
+        : nullptr;
+    USHORT stackCount = captureStack ? captureStack(0, 16, stack, nullptr) : 0;
+    std::ofstream log("remote_controller_crash.log", std::ios::app);
+    if (log.is_open()) {
+        log << "Unhandled exception in " << modulePath
+            << ": code=0x" << std::uppercase << std::hex << exceptionCode
+            << ", address=0x" << exceptionAddress
+            << ", module=" << faultModule << std::dec << "\n";
+        log << "Stack:";
+        for (USHORT i = 0; i < stackCount; ++i) {
+            log << " 0x" << std::uppercase << std::hex << (ULONG_PTR)stack[i];
+        }
+        log << std::dec << "\n";
+        log.flush();
+    }
+
+    char message[512] = {};
+    std::snprintf(message, sizeof(message),
+                  "Remote Controller crashed.\n\nException: 0x%08lX\nAddress: 0x%p\nModule: %s\n\nDetails saved to remote_controller_crash.log.",
+                  (unsigned long)exceptionCode,
+                  (void*)exceptionAddress,
+                  faultModule);
+    MessageBoxA(nullptr, message, "Remote Controller Crash", MB_OK | MB_ICONERROR | MB_TOPMOST);
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+
+inline void InstallCrashDiagnostics() {
+    SetUnhandledExceptionFilter(RemoteControllerUnhandledExceptionFilter);
+    SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX);
+}
+
 // ============================================================================
 // PROTOCOL DEFINITIONS
 // ============================================================================
@@ -178,6 +239,12 @@ namespace Console {
 #define RC_DEFAULT_PORT     5000
 #define RC_CONTROL_PORT     5001
 #define RC_MAGIC            0x52435043  // "RCPC"
+
+constexpr uint32_t RC_MAX_PACKET_SIZE = 16u * 1024u * 1024u;
+constexpr uint32_t RC_MAX_CONTROL_PACKET_SIZE = 4096u;
+constexpr uint32_t RC_MAX_CHAT_PACKET_SIZE = 1024u * 1024u;
+constexpr uint32_t RC_MAX_FILE_CHUNK_SIZE = 1024u * 1024u;
+constexpr uint32_t RC_MAX_FILE_LIST_SIZE = 4u * 1024u * 1024u;
 
 // Message types
 enum MessageType : uint8_t {
@@ -206,6 +273,8 @@ enum MessageType : uint8_t {
     MSG_FILE_LIST_RESP      = 0x57,  // Directory listing response
     MSG_FILE_DELETE_REQ     = 0x58,  // Remote file/folder deletion
     MSG_FILE_MKDIR_REQ      = 0x59,  // Remote directory creation
+    MSG_FILE_OPERATION_RESULT = 0x5A, // File operation result
+    MSG_FILE_DOWNLOAD_REQ   = 0x5B,  // Request remote file download
     MSG_DISCONNECT          = 0xFF
 };
 
@@ -226,10 +295,9 @@ struct HandshakeInit {
     uint8_t  unattendedMode;   // 0 = require approval, 1 = auto-accept
 };
 
-// Handshake key material exchange
+// Standard P-256 uncompressed public point: 04 || X(32) || Y(32).
 struct ECDHKeyExchange {
-    uint8_t  publicKey[128];   // Random key material for shared key derivation
-    uint32_t keyLength;
+    uint8_t  publicKey[65];
 };
 
 // Connection request (from viewer)
@@ -265,6 +333,7 @@ struct FileTransferBegin {
     uint32_t transferId;
     uint64_t fileSize;
     uint32_t chunkSize;
+    uint8_t sha256[32];
     char     fileName[260];
 };
 
@@ -284,7 +353,7 @@ struct FileTransferRequest {
     uint64_t fileSize;
     uint32_t chunkSize;
     uint32_t totalChunks;
-    uint32_t checksum;
+    uint8_t sha256[32];
     char     fileName[260];
 };
 
@@ -328,18 +397,182 @@ struct FileMkdirRequest {
     char path[260];
 };
 
+struct FileDownloadRequest {
+    char path[260];
+};
+
+struct FileOperationResult {
+    uint8_t operation;
+    uint8_t success;
+    uint32_t errorCode;
+    char path[260];
+};
+
 #pragma pack(pop)
 
+inline uint32_t GetPacketPayloadLimit(uint8_t type) {
+    switch (type) {
+    case MSG_CONTROL_MOUSE:
+    case MSG_CONTROL_KEYBOARD:
+    case MSG_SPECIAL_KEY:
+    case MSG_PING:
+    case MSG_PONG:
+    case MSG_DISCONNECT:
+        return RC_MAX_CONTROL_PACKET_SIZE;
+    case MSG_CHAT_TEXT:
+    case MSG_CLIPBOARD_TEXT:
+        return RC_MAX_CHAT_PACKET_SIZE;
+    case MSG_FILE_TRANSFER_CHUNK:
+        return RC_MAX_FILE_CHUNK_SIZE + sizeof(FileTransferChunkHeader);
+    case MSG_FILE_LIST_RESP:
+        return RC_MAX_FILE_LIST_SIZE;
+    default:
+        return RC_MAX_PACKET_SIZE;
+    }
+}
+
 // ============================================================================
-// ENCRYPTION (Windows CryptoAPI)
+// ENCRYPTION (Windows CNG, loaded at runtime for MinGW compatibility)
 // ============================================================================
 
-class SecureChannel {
+typedef LONG NTSTATUS;
+typedef void* BCRYPT_ALG_HANDLE;
+typedef void* BCRYPT_KEY_HANDLE;
+typedef void* BCRYPT_SECRET_HANDLE;
+
+struct BCRYPT_ECCKEY_BLOB_LOCAL {
+    ULONG dwMagic;
+    ULONG cbKey;
+};
+
+struct BCRYPT_KDF_PARAMETER_LOCAL {
+    LPCWSTR pszParameter;
+    PUCHAR pbBuffer;
+    ULONG cbBuffer;
+};
+
+struct BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO_LOCAL {
+    ULONG cbSize;
+    ULONG dwInfoVersion;
+    PUCHAR pbNonce;
+    ULONG cbNonce;
+    PUCHAR pbAuthData;
+    ULONG cbAuthData;
+    PUCHAR pbTag;
+    ULONG cbTag;
+    PUCHAR pbMacContext;
+    ULONG cbMacContext;
+    ULONG cbAAD;
+    ULONGLONG cbData;
+    ULONG dwFlags;
+};
+
+constexpr NTSTATUS RC_STATUS_SUCCESS = 0;
+constexpr ULONG RC_BCRYPT_ECCPUBLIC_MAGIC = 0x31534345;
+constexpr ULONG RC_BCRYPT_KDF_HASH = 0x00000002;
+constexpr ULONG RC_BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO_VERSION = 1;
+
+#if 0
+class LegacySecureChannel {
 private:
     HCRYPTPROV hProv = 0;
+    HMODULE bcrypt = nullptr;
+    BCRYPT_ALG_HANDLE ecdhAlgorithm = nullptr;
+    BCRYPT_KEY_HANDLE privateKey = nullptr;
+    BCRYPT_SECRET_HANDLE sharedSecret = nullptr;
     std::vector<uint8_t> publicKey;
     std::vector<uint8_t> aesKey;
     bool initialized = false;
+    bool legacyMode = false;
+
+    typedef NTSTATUS (WINAPI* BCryptOpenAlgorithmProviderFn)(BCRYPT_ALG_HANDLE*, LPCWSTR, LPCWSTR, ULONG);
+    typedef NTSTATUS (WINAPI* BCryptCloseAlgorithmProviderFn)(BCRYPT_ALG_HANDLE, ULONG);
+    typedef NTSTATUS (WINAPI* BCryptGenerateKeyPairFn)(BCRYPT_ALG_HANDLE, BCRYPT_KEY_HANDLE*, ULONG, ULONG);
+    typedef NTSTATUS (WINAPI* BCryptFinalizeKeyPairFn)(BCRYPT_KEY_HANDLE, ULONG);
+    typedef NTSTATUS (WINAPI* BCryptExportKeyFn)(BCRYPT_KEY_HANDLE, BCRYPT_KEY_HANDLE, LPCWSTR, PUCHAR, ULONG, ULONG*, ULONG);
+    typedef NTSTATUS (WINAPI* BCryptImportKeyPairFn)(BCRYPT_ALG_HANDLE, BCRYPT_KEY_HANDLE, LPCWSTR, BCRYPT_KEY_HANDLE*, PUCHAR, ULONG, ULONG);
+    typedef NTSTATUS (WINAPI* BCryptSecretAgreementFn)(BCRYPT_KEY_HANDLE, BCRYPT_KEY_HANDLE, BCRYPT_SECRET_HANDLE*, ULONG);
+    typedef NTSTATUS (WINAPI* BCryptDeriveKeyFn)(BCRYPT_SECRET_HANDLE, LPCWSTR, BCRYPT_KDF_PARAMETER_LOCAL*, PUCHAR, ULONG, ULONG*, ULONG);
+    typedef NTSTATUS (WINAPI* BCryptDestroyKeyFn)(BCRYPT_KEY_HANDLE);
+    typedef NTSTATUS (WINAPI* BCryptDestroySecretFn)(BCRYPT_SECRET_HANDLE);
+    typedef NTSTATUS (WINAPI* BCryptGetPropertyFn)(void*, LPCWSTR, PUCHAR, ULONG, ULONG*, ULONG);
+    typedef NTSTATUS (WINAPI* BCryptSetPropertyFn)(void*, LPCWSTR, PUCHAR, ULONG, ULONG);
+    typedef NTSTATUS (WINAPI* BCryptGenerateSymmetricKeyFn)(BCRYPT_ALG_HANDLE, BCRYPT_KEY_HANDLE*, PUCHAR, ULONG, PUCHAR, ULONG, ULONG);
+    typedef NTSTATUS (WINAPI* BCryptEncryptFn)(BCRYPT_KEY_HANDLE, PUCHAR, ULONG, void*, PUCHAR, ULONG, PUCHAR, ULONG, ULONG*, ULONG);
+    typedef NTSTATUS (WINAPI* BCryptDecryptFn)(BCRYPT_KEY_HANDLE, PUCHAR, ULONG, void*, PUCHAR, ULONG, PUCHAR, ULONG, ULONG*, ULONG);
+
+    BCryptOpenAlgorithmProviderFn openAlgorithm = nullptr;
+    BCryptCloseAlgorithmProviderFn closeAlgorithm = nullptr;
+    BCryptGenerateKeyPairFn generateKeyPair = nullptr;
+    BCryptFinalizeKeyPairFn finalizeKeyPair = nullptr;
+    BCryptExportKeyFn exportKey = nullptr;
+    BCryptImportKeyPairFn importKeyPair = nullptr;
+    BCryptSecretAgreementFn secretAgreement = nullptr;
+    BCryptDeriveKeyFn deriveKey = nullptr;
+    BCryptDestroyKeyFn destroyKey = nullptr;
+    BCryptDestroySecretFn destroySecret = nullptr;
+    BCryptGetPropertyFn getProperty = nullptr;
+    BCryptSetPropertyFn setProperty = nullptr;
+    BCryptGenerateSymmetricKeyFn generateSymmetricKey = nullptr;
+    BCryptEncryptFn encryptCng = nullptr;
+    BCryptDecryptFn decryptCng = nullptr;
+
+    template <typename T>
+    bool LoadCngFunction(T& target, const char* name) {
+        target = reinterpret_cast<T>(GetProcAddress(bcrypt, name));
+        return target != nullptr;
+    }
+
+    static std::string FormatStatus(NTSTATUS status) {
+        std::ostringstream stream;
+        stream << std::uppercase << std::hex << std::setw(8) << std::setfill('0')
+               << (static_cast<uint32_t>(status));
+        return stream.str();
+    }
+
+    bool LoadCng() {
+        bcrypt = LoadLibraryA("bcrypt.dll");
+        if (!bcrypt) {
+            Console::PrintError("LoadLibraryA(bcrypt.dll) failed: Win32 error " + std::to_string(GetLastError()));
+            return false;
+        }
+
+#define RC_LOAD_CNG(fn, name) \
+        if (!LoadCngFunction(fn, name)) { \
+            Console::PrintError(std::string("Missing CNG function ") + name); \
+            return false; \
+        }
+        RC_LOAD_CNG(openAlgorithm, "BCryptOpenAlgorithmProvider");
+        RC_LOAD_CNG(closeAlgorithm, "BCryptCloseAlgorithmProvider");
+        RC_LOAD_CNG(generateKeyPair, "BCryptGenerateKeyPair");
+        RC_LOAD_CNG(finalizeKeyPair, "BCryptFinalizeKeyPair");
+        RC_LOAD_CNG(exportKey, "BCryptExportKey");
+        RC_LOAD_CNG(importKeyPair, "BCryptImportKeyPair");
+        RC_LOAD_CNG(secretAgreement, "BCryptSecretAgreement");
+        RC_LOAD_CNG(deriveKey, "BCryptDeriveKey");
+        RC_LOAD_CNG(destroyKey, "BCryptDestroyKey");
+        RC_LOAD_CNG(destroySecret, "BCryptDestroySecret");
+        RC_LOAD_CNG(getProperty, "BCryptGetProperty");
+        RC_LOAD_CNG(setProperty, "BCryptSetProperty");
+        RC_LOAD_CNG(generateSymmetricKey, "BCryptGenerateSymmetricKey");
+        RC_LOAD_CNG(encryptCng, "BCryptEncrypt");
+        RC_LOAD_CNG(decryptCng, "BCryptDecrypt");
+#undef RC_LOAD_CNG
+        return true;
+    }
+
+    bool IsLegacyWindows() const {
+        char useCng[8] = {};
+        DWORD useCngLength = GetEnvironmentVariableA("RC_USE_CNG", useCng, sizeof(useCng));
+        if (useCngLength > 0 && (useCng[0] == '1' || useCng[0] == 'y' || useCng[0] == 'Y')) {
+            return false;
+        }
+
+        // Compatibility mode is the safe default because some VM images
+        // expose a bcrypt.dll that crashes inside the provider.
+        return true;
+
+    }
 
     bool BuildSessionKey(const uint8_t* iv, HCRYPTKEY& hKey) {
         hKey = 0;
@@ -376,13 +609,29 @@ private:
     }
 
 public:
-    SecureChannel() {}
+    LegacySecureChannel() {}
 
-    ~SecureChannel() {
+    ~LegacySecureChannel() {
         Cleanup();
     }
 
     void Cleanup() {
+        if (sharedSecret && destroySecret) {
+            destroySecret(sharedSecret);
+            sharedSecret = nullptr;
+        }
+        if (privateKey && destroyKey) {
+            destroyKey(privateKey);
+            privateKey = nullptr;
+        }
+        if (ecdhAlgorithm && closeAlgorithm) {
+            closeAlgorithm(ecdhAlgorithm, 0);
+            ecdhAlgorithm = nullptr;
+        }
+        if (bcrypt) {
+            FreeLibrary(bcrypt);
+            bcrypt = nullptr;
+        }
         if (hProv != 0) {
             CryptReleaseContext(hProv, 0);
             hProv = 0;
@@ -390,6 +639,7 @@ public:
         publicKey.clear();
         aesKey.clear();
         initialized = false;
+        legacyMode = false;
     }
 
     bool Initialize() {
@@ -400,11 +650,55 @@ public:
             return false;
         }
 
-        publicKey.resize(32);
-        if (!CryptGenRandom(hProv, (DWORD)publicKey.size(), publicKey.data())) {
-            Console::PrintError("Failed to generate local key material");
+        // Older VM images can expose a defective bcrypt.dll implementation.
+        // Keep them usable with the legacy CryptoAPI path instead of crashing
+        // inside the provider before a session can be established.
+        if (IsLegacyWindows()) {
+            legacyMode = true;
+            publicKey.resize(32);
+            if (!CryptGenRandom(hProv, (DWORD)publicKey.size(), publicKey.data())) {
+                Console::PrintError("Failed to generate legacy session material");
+                return false;
+            }
+            initialized = true;
+            Console::PrintWarning("Legacy Windows crypto compatibility mode enabled");
+            return true;
+        }
+
+        if (!LoadCng()) return false;
+
+        NTSTATUS status = openAlgorithm(&ecdhAlgorithm, L"ECDH_P256", nullptr, 0);
+        if (status != RC_STATUS_SUCCESS) {
+            Console::PrintError("BCryptOpenAlgorithmProvider(ECDH_P256) failed: NTSTATUS 0x" +
+                                FormatStatus(status));
             return false;
         }
+
+        status = generateKeyPair(ecdhAlgorithm, &privateKey, 256, 0);
+        if (status != RC_STATUS_SUCCESS) {
+            Console::PrintError("BCryptGenerateKeyPair failed: NTSTATUS 0x" + FormatStatus(status));
+            return false;
+        }
+
+        status = finalizeKeyPair(privateKey, 0);
+        if (status != RC_STATUS_SUCCESS) {
+            Console::PrintError("BCryptFinalizeKeyPair failed: NTSTATUS 0x" + FormatStatus(status));
+            return false;
+        }
+
+        ULONG publicSize = 0;
+        status = exportKey(privateKey, nullptr, L"ECCPUBLICBLOB", nullptr, 0, &publicSize, 0);
+        if (status != RC_STATUS_SUCCESS || publicSize > 128) {
+            Console::PrintError("BCryptExportKey size query failed: NTSTATUS 0x" + FormatStatus(status));
+            return false;
+        }
+        publicKey.resize(publicSize);
+        status = exportKey(privateKey, nullptr, L"ECCPUBLICBLOB", publicKey.data(), publicSize, &publicSize, 0);
+        if (status != RC_STATUS_SUCCESS) {
+            Console::PrintError("BCryptExportKey failed: NTSTATUS 0x" + FormatStatus(status));
+            return false;
+        }
+        publicKey.resize(publicSize);
 
         initialized = true;
         return true;
@@ -415,109 +709,185 @@ public:
     }
 
     bool DeriveSharedSecret(const uint8_t* peerPublicKey, uint32_t peerKeyLen) {
-        if (!initialized) return false;
-        if (!peerPublicKey || peerKeyLen == 0 || peerKeyLen > 128) return false;
+        if (!initialized || !peerPublicKey || peerKeyLen == 0 || peerKeyLen > 128) return false;
 
-        std::vector<uint8_t> peer(peerPublicKey, peerPublicKey + peerKeyLen);
-
-        std::vector<uint8_t> material;
-        material.reserve(publicKey.size() + peer.size());
-
-        // Stable ordering ensures both peers derive identical keys.
-        if (std::lexicographical_compare(peer.begin(), peer.end(), publicKey.begin(), publicKey.end())) {
-            material.insert(material.end(), peer.begin(), peer.end());
-            material.insert(material.end(), publicKey.begin(), publicKey.end());
-        } else {
-            material.insert(material.end(), publicKey.begin(), publicKey.end());
-            material.insert(material.end(), peer.begin(), peer.end());
+        if (legacyMode) {
+            if (!peerPublicKey || peerKeyLen == 0 || peerKeyLen > 128) return false;
+            std::vector<uint8_t> peer(peerPublicKey, peerPublicKey + peerKeyLen);
+            std::vector<uint8_t> material;
+            material.reserve(publicKey.size() + peer.size());
+            if (std::lexicographical_compare(peer.begin(), peer.end(), publicKey.begin(), publicKey.end())) {
+                material.insert(material.end(), peer.begin(), peer.end());
+                material.insert(material.end(), publicKey.begin(), publicKey.end());
+            } else {
+                material.insert(material.end(), publicKey.begin(), publicKey.end());
+                material.insert(material.end(), peer.begin(), peer.end());
+            }
+            HCRYPTHASH hash = 0;
+            if (!CryptCreateHash(hProv, CALG_SHA_256, 0, 0, &hash)) return false;
+            aesKey.resize(32);
+            DWORD length = (DWORD)aesKey.size();
+            bool ok = CryptHashData(hash, material.data(), (DWORD)material.size(), 0) == TRUE &&
+                      CryptGetHashParam(hash, HP_HASHVAL, aesKey.data(), &length, 0) == TRUE &&
+                      length == aesKey.size();
+            CryptDestroyHash(hash);
+            if (ok) Console::PrintWarning("Legacy CryptoAPI AES-CBC compatibility mode enabled");
+            return ok;
         }
 
-        HCRYPTHASH hHash = 0;
-        if (!CryptCreateHash(hProv, CALG_SHA_256, 0, 0, &hHash)) {
-            Console::PrintError("Failed to create session hash");
+        if (!privateKey) return false;
+
+        BCRYPT_KEY_HANDLE peerKey = nullptr;
+        if (importKeyPair(ecdhAlgorithm, nullptr, L"ECCPUBLICBLOB", &peerKey,
+                          const_cast<PUCHAR>(peerPublicKey), peerKeyLen, 0) != RC_STATUS_SUCCESS) {
+            return false;
+        }
+        bool ok = secretAgreement(privateKey, peerKey, &sharedSecret, 0) == RC_STATUS_SUCCESS;
+        destroyKey(peerKey);
+        if (!ok) {
+            Console::PrintError("Failed to perform ECDH agreement");
             return false;
         }
 
-        bool ok = CryptHashData(hHash, material.data(), (DWORD)material.size(), 0) == TRUE;
+        wchar_t hashName[] = L"SHA256";
+        BCRYPT_KDF_PARAMETER_LOCAL parameter{L"HashAlgorithm", (PUCHAR)hashName, sizeof(hashName)};
         aesKey.resize(32);
-        DWORD outLen = (DWORD)aesKey.size();
-        if (ok) {
-            ok = CryptGetHashParam(hHash, HP_HASHVAL, aesKey.data(), &outLen, 0) == TRUE;
-        }
-        CryptDestroyHash(hHash);
+        ULONG derivedSize = 0;
+        ok = deriveKey(sharedSecret, L"HASH", &parameter, aesKey.data(), (ULONG)aesKey.size(), &derivedSize, 0) == RC_STATUS_SUCCESS &&
+             derivedSize == aesKey.size();
+        if (!ok) return false;
 
-        if (!ok || outLen < 32) {
-            Console::PrintError("Failed to derive encryption key");
-            return false;
-        }
-
-        Console::PrintSuccess("Secure channel established (CryptoAPI AES-256)");
+        Console::PrintSuccess("Secure channel established (CNG ECDH P-256 + SHA-256)");
         return true;
     }
 
-    std::vector<uint8_t> Encrypt(const uint8_t* data, size_t len) {
-        if (hProv == 0 || aesKey.empty() || (!data && len > 0)) return {};
+    std::vector<uint8_t> Encrypt(const uint8_t* data, size_t len,
+                                 const uint8_t* aad = nullptr, size_t aadLen = 0) {
+        if (hProv == 0 || aesKey.empty() || (!data && len > 0) || len > UINT32_MAX) return {};
 
-        uint8_t iv[16] = {0};
-        if (!CryptGenRandom(hProv, sizeof(iv), iv)) {
-            return {};
+        if (legacyMode) {
+            uint8_t iv[16] = {};
+            if (!CryptGenRandom(hProv, sizeof(iv), iv)) return {};
+            HCRYPTKEY key = 0;
+            if (!BuildSessionKey(iv, key)) return {};
+            DWORD plainLength = (DWORD)len;
+            DWORD bufferLength = plainLength + 16;
+            std::vector<uint8_t> cipher(bufferLength);
+            if (len > 0) memcpy(cipher.data(), data, len);
+            BOOL ok = CryptEncrypt(key, 0, TRUE, 0, cipher.data(), &plainLength, bufferLength);
+            CryptDestroyKey(key);
+            if (!ok) return {};
+            cipher.resize(plainLength);
+            std::vector<uint8_t> result(sizeof(iv) + cipher.size());
+            memcpy(result.data(), iv, sizeof(iv));
+            if (!cipher.empty()) memcpy(result.data() + sizeof(iv), cipher.data(), cipher.size());
+            return result;
         }
 
-        HCRYPTKEY hKey = 0;
-        if (!BuildSessionKey(iv, hKey)) {
-            return {};
+        BCRYPT_ALG_HANDLE algorithm = nullptr;
+        BCRYPT_KEY_HANDLE key = nullptr;
+        std::vector<uint8_t> keyObject;
+        ULONG objectLength = 0;
+        ULONG resultLength = 0;
+        uint8_t nonce[12] = {};
+        uint8_t tag[16] = {};
+        bool ok = CryptGenRandom(hProv, sizeof(nonce), nonce) == TRUE &&
+            openAlgorithm(&algorithm, L"AES", nullptr, 0) == RC_STATUS_SUCCESS;
+        wchar_t gcmMode[] = L"GCM";
+        if (ok) ok = setProperty(algorithm, L"ChainingMode", (PUCHAR)gcmMode, sizeof(gcmMode), 0) == RC_STATUS_SUCCESS;
+        if (ok) ok = getProperty(algorithm, L"ObjectLength", (PUCHAR)&objectLength, sizeof(objectLength), &resultLength, 0) == RC_STATUS_SUCCESS;
+        if (ok) {
+            keyObject.resize(objectLength);
+            ok = generateSymmetricKey(algorithm, &key, keyObject.data(), objectLength,
+                                      aesKey.data(), (ULONG)aesKey.size(), 0) == RC_STATUS_SUCCESS;
         }
 
-        DWORD plainLen = (DWORD)len;
-        DWORD bufLen = plainLen + 16;
-        std::vector<uint8_t> cipher(bufLen);
-        if (len > 0) {
-            memcpy(cipher.data(), data, len);
-        }
+        std::vector<uint8_t> cipher(len);
+        BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO_LOCAL auth{};
+        auth.cbSize = sizeof(auth);
+        auth.dwInfoVersion = RC_BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO_VERSION;
+        auth.pbNonce = nonce;
+        auth.cbNonce = sizeof(nonce);
+        auth.pbAuthData = const_cast<PUCHAR>(aad);
+        auth.cbAuthData = (ULONG)aadLen;
+        auth.pbTag = tag;
+        auth.cbTag = sizeof(tag);
+        if (ok) ok = encryptCng(key, const_cast<PUCHAR>(data), (ULONG)len, &auth,
+                                nullptr, 0, cipher.data(), (ULONG)cipher.size(), &resultLength, 0) == RC_STATUS_SUCCESS;
 
-        BOOL ok = CryptEncrypt(hKey, 0, TRUE, 0, cipher.data(), &plainLen, bufLen);
-        CryptDestroyKey(hKey);
-        if (!ok) {
-            return {};
-        }
+        if (key && destroyKey) destroyKey(key);
+        if (algorithm && closeAlgorithm) closeAlgorithm(algorithm, 0);
+        if (!ok || resultLength != len) return {};
 
-        cipher.resize(plainLen);
-
-        std::vector<uint8_t> result(16 + cipher.size());
-        memcpy(result.data(), iv, 16);
-        if (!cipher.empty()) {
-            memcpy(result.data() + 16, cipher.data(), cipher.size());
-        }
+        std::vector<uint8_t> result(sizeof(nonce) + sizeof(tag) + cipher.size());
+        memcpy(result.data(), nonce, sizeof(nonce));
+        memcpy(result.data() + sizeof(nonce), tag, sizeof(tag));
+        if (!cipher.empty()) memcpy(result.data() + sizeof(nonce) + sizeof(tag), cipher.data(), cipher.size());
         return result;
     }
 
-    std::vector<uint8_t> Decrypt(const uint8_t* data, size_t len) {
-        if (hProv == 0 || aesKey.empty() || !data || len < 16) return {};
+    std::vector<uint8_t> Decrypt(const uint8_t* data, size_t len,
+                                 const uint8_t* aad = nullptr, size_t aadLen = 0) {
+        constexpr size_t nonceSize = 12;
+        constexpr size_t tagSize = 16;
+        if (hProv == 0 || aesKey.empty() || !data || len < nonceSize + tagSize || len - nonceSize - tagSize > UINT32_MAX) return {};
 
-        HCRYPTKEY hKey = 0;
-        if (!BuildSessionKey(data, hKey)) {
-            return {};
+        if (legacyMode) {
+            if (len < 16) return {};
+            HCRYPTKEY key = 0;
+            if (!BuildSessionKey(data, key)) return {};
+            size_t cipherLength = len - 16;
+            std::vector<uint8_t> plain(cipherLength);
+            if (cipherLength > 0) memcpy(plain.data(), data + 16, cipherLength);
+            DWORD plainLength = (DWORD)cipherLength;
+            BOOL ok = CryptDecrypt(key, 0, TRUE, 0, plain.data(), &plainLength);
+            CryptDestroyKey(key);
+            if (!ok) return {};
+            plain.resize(plainLength);
+            return plain;
         }
 
-        size_t cipherLen = len - 16;
+        BCRYPT_ALG_HANDLE algorithm = nullptr;
+        BCRYPT_KEY_HANDLE key = nullptr;
+        std::vector<uint8_t> keyObject;
+        ULONG objectLength = 0;
+        ULONG resultLength = 0;
+        bool ok = openAlgorithm(&algorithm, L"AES", nullptr, 0) == RC_STATUS_SUCCESS;
+        wchar_t gcmMode[] = L"GCM";
+        if (ok) ok = setProperty(algorithm, L"ChainingMode", (PUCHAR)gcmMode, sizeof(gcmMode), 0) == RC_STATUS_SUCCESS;
+        if (ok) ok = getProperty(algorithm, L"ObjectLength", (PUCHAR)&objectLength, sizeof(objectLength), &resultLength, 0) == RC_STATUS_SUCCESS;
+        if (ok) {
+            keyObject.resize(objectLength);
+            ok = generateSymmetricKey(algorithm, &key, keyObject.data(), objectLength,
+                                      aesKey.data(), (ULONG)aesKey.size(), 0) == RC_STATUS_SUCCESS;
+        }
+
+        size_t cipherLen = len - nonceSize - tagSize;
         std::vector<uint8_t> result(cipherLen);
-        if (cipherLen > 0) {
-            memcpy(result.data(), data + 16, cipherLen);
-        }
+        BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO_LOCAL auth{};
+        auth.cbSize = sizeof(auth);
+        auth.dwInfoVersion = RC_BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO_VERSION;
+        auth.pbNonce = const_cast<PUCHAR>(data);
+        auth.cbNonce = nonceSize;
+        auth.pbAuthData = const_cast<PUCHAR>(aad);
+        auth.cbAuthData = (ULONG)aadLen;
+        auth.pbTag = const_cast<PUCHAR>(data + nonceSize);
+        auth.cbTag = tagSize;
+        if (ok) ok = decryptCng(key, const_cast<PUCHAR>(data + nonceSize + tagSize), (ULONG)cipherLen,
+                                &auth, nullptr, 0, result.data(), (ULONG)result.size(), &resultLength, 0) == RC_STATUS_SUCCESS;
 
-        DWORD plainLen = (DWORD)cipherLen;
-        BOOL ok = CryptDecrypt(hKey, 0, TRUE, 0, result.data(), &plainLen);
-        CryptDestroyKey(hKey);
-        if (!ok) {
-            return {};
-        }
-
-        result.resize(plainLen);
+        if (key && destroyKey) destroyKey(key);
+        if (algorithm && closeAlgorithm) closeAlgorithm(algorithm, 0);
+        if (!ok || resultLength != cipherLen) return {};
         return result;
     }
 
     bool IsReady() const { return initialized && !aesKey.empty(); }
+    size_t GetWireOverhead() const { return legacyMode ? 16 : 28; }
 };
+#endif
+
+using SecureChannel = remote_controller::crypto::SecureChannel;
 
 // ============================================================================
 // CONTACT STORAGE (IP Address Book)
@@ -720,15 +1090,24 @@ public:
 
     static bool SendPacket(SOCKET sock, uint8_t type, const void* payload, size_t payloadLen,
                           SecureChannel* crypto = nullptr, uint32_t seq = 0) {
+        if (payloadLen > GetPacketPayloadLimit(type) || payloadLen > UINT32_MAX ||
+            (payloadLen > 0 && payload == nullptr)) {
+            return false;
+        }
+
         PacketHeader header;
         header.magic = RC_MAGIC;
         header.type = type;
         header.sequence = seq;
 
-        if (crypto && crypto->IsReady() && payload && payloadLen > 0) {
-            auto encrypted = crypto->Encrypt((const uint8_t*)payload, payloadLen);
+        if (crypto && crypto->IsReady()) {
+            header.length = crypto->GetWireOverhead() == 16 ? 0 :
+                (uint32_t)(payloadLen + crypto->GetWireOverhead());
+            auto encrypted = crypto->Encrypt((const uint8_t*)payload, payloadLen,
+                                              (const uint8_t*)&header, sizeof(header));
             if (encrypted.empty()) return false;
-            header.length = (uint32_t)encrypted.size();
+            if (crypto->GetWireOverhead() == 16) header.length = (uint32_t)encrypted.size();
+            if (encrypted.size() != header.length) return false;
             if (!SendAll(sock, &header, sizeof(header))) return false;
             if (!SendAll(sock, encrypted.data(), encrypted.size())) return false;
         } else {
@@ -740,22 +1119,30 @@ public:
     }
 
     static bool RecvPacket(SOCKET sock, PacketHeader& header, std::vector<uint8_t>& payload,
-                          SecureChannel* crypto = nullptr) {
+                          SecureChannel* crypto = nullptr, uint32_t* expectedSequence = nullptr) {
         if (!RecvAll(sock, &header, sizeof(header))) return false;
         if (header.magic != RC_MAGIC) return false;
+        if (expectedSequence && header.sequence != *expectedSequence) return false;
+        uint64_t wireLimit = GetPacketPayloadLimit(header.type);
+        if (crypto && crypto->IsReady()) wireLimit += crypto->GetWireOverhead();
+        if (header.length > wireLimit) return false;
 
         if (header.length > 0) {
             std::vector<uint8_t> raw(header.length);
             if (!RecvAll(sock, raw.data(), header.length)) return false;
 
             if (crypto && crypto->IsReady()) {
-                payload = crypto->Decrypt(raw.data(), raw.size());
-                if (payload.empty() && header.length > 0) return false;
+                payload = crypto->Decrypt(raw.data(), raw.size(),
+                                          (const uint8_t*)&header, sizeof(header));
+                if (payload.empty() && header.length > crypto->GetWireOverhead() + 16) return false;
             } else {
                 payload = std::move(raw);
             }
         } else {
             payload.clear();
+        }
+        if (expectedSequence) {
+            *expectedSequence = header.sequence + 1;
         }
         return true;
     }
@@ -777,6 +1164,27 @@ public:
         return "127.0.0.1";
     }
 };
+
+inline bool ComputeFileSHA256(const std::string& path, uint8_t digest[32]) {
+    if (!digest) return false;
+
+    std::ifstream file(path.c_str(), std::ios::binary);
+    if (!file.is_open()) return false;
+
+    std::vector<char> buffer(64 * 1024);
+    std::vector<uint8_t> contents;
+    bool ok = true;
+    while (file) {
+        file.read(buffer.data(), (std::streamsize)buffer.size());
+        std::streamsize count = file.gcount();
+        if (count > 0) contents.insert(contents.end(), buffer.data(), buffer.data() + count);
+    }
+    if (!ok) return false;
+    std::array<uint8_t, 32> result{};
+    if (!remote_controller::crypto::SecureChannel::Sha256(contents.data(), contents.size(), result)) return false;
+    memcpy(digest, result.data(), result.size());
+    return true;
+}
 
 // ============================================================================
 // DEVICE ID GENERATOR (from unique_generator.cpp)
@@ -818,26 +1226,14 @@ public:
             }
         }
 
-        // SHA-256 hash
-        HCRYPTPROV hProv = 0;
-        HCRYPTHASH hHash = 0;
-        BYTE hash[32] = {0};
-        DWORD hashLen = 32;
-        bool hashReady = false;
-
-        if (CryptAcquireContext(&hProv, nullptr, nullptr, PROV_RSA_AES, CRYPT_VERIFYCONTEXT)) {
-            if (CryptCreateHash(hProv, CALG_SHA_256, 0, 0, &hHash)) {
-                CryptHashData(hHash, (BYTE*)combined.c_str(), (DWORD)combined.length(), 0);
-                hashReady = CryptGetHashParam(hHash, HP_HASHVAL, hash, &hashLen, 0) == TRUE;
-                CryptDestroyHash(hHash);
-            }
-            CryptReleaseContext(hProv, 0);
-        }
+        std::array<uint8_t, 32> hash{};
+        bool hashReady = remote_controller::crypto::SecureChannel::Sha256(
+            reinterpret_cast<const uint8_t*>(combined.data()), combined.size(), hash);
 
         // Convert to readable format: XXX-XXX-XXX
         uint64_t val = 0;
-        if (hashReady && hashLen >= sizeof(uint64_t)) {
-            memcpy(&val, hash, sizeof(uint64_t));
+        if (hashReady) {
+            memcpy(&val, hash.data(), sizeof(uint64_t));
         } else {
             // Fallback keeps deterministic ID format even if crypto APIs fail.
             val = (uint64_t)std::hash<std::string>{}(combined);

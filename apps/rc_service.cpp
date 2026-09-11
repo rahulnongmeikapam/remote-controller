@@ -292,7 +292,7 @@ private:
     SOCKET listenSocket = INVALID_SOCKET;
     bool running = false;
     AllowedIPManager ipManager;
-    SecureChannel crypto;
+    SecureChannel crypto{false};
 
 public:
     bool Start(const ServiceConfig& config) {
@@ -583,6 +583,7 @@ void ManageAllowedIPs(AllowedIPManager& ipManager) {
 // ============================================================================
 
 int main(int argc, char* argv[]) {
+    InstallCrashDiagnostics();
     Console::InitConsole();
     Console::SetTitle("Remote Controller - Service Monitor");
 
