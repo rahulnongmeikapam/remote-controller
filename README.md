@@ -211,6 +211,12 @@ cmake --build build --config Release --verbose
 - Multi-monitor capture and coordinate mapping are incomplete.
 - The service monitor is not a native Windows Service implementation.
 
+## 👤 Author and Support
+
+For project questions or support, contact `mohit@mohitpatel.work`.
+
+**⚠️ Disclaimer:** This project is intended for legitimate remote administration, education, and authorized testing. Always obtain proper authorization before accessing another computer.
+
 ## License and Authorization
 
 Preserve the project license and permission notice when redistributing this software. Always obtain authorization before accessing another computer.
