@@ -213,7 +213,7 @@ cmake --build build --config Release --verbose
 
 ## 👤 Author and Support
 
-For project questions or support, contact `mohit@mohitpatel.work`.
+For project questions or support, contact 
 
 **⚠️ Disclaimer:** This project is intended for legitimate remote administration, education, and authorized testing. Always obtain proper authorization before accessing another computer.
 
